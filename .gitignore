@@ -1,0 +1,25 @@
+# raw and processed data are large; share via Drive, not git
+data/raw/**
+data/processed/**
+!data/raw/*/
+!data/raw/*/.gitkeep
+!data/processed/.gitkeep
+!data/README.md
+
+# python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.pytest_cache/
+*.egg-info/
+
+# environments / editors
+.venv/
+.env
+.vscode/
+.idea/
+.DS_Store
+
+# model checkpoints
+*.pt
+*.pth
