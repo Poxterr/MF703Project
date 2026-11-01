@@ -17,7 +17,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from .pairs import KEY
+from .schema import KEY
 
 
 def hedge_pnl(pairs: pd.DataFrame, delta_cols: list[str], cost_bp: float = 1.0,

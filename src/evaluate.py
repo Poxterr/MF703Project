@@ -15,16 +15,24 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-DELTA_BUCKETS = np.round(np.arange(0.1, 1.0, 0.1), 1)
-MATURITY_BINS = [0, 30, 91, 182, 365, 730, 10_000]
-MATURITY_LABELS = ["<1m", "1-3m", "3-6m", "6-12m", "1-2y", ">2y"]
+# Bucket columns (``delta_bucket``, signed, and ``ttm_class``) are produced by the pipeline
+# (src/build_dataset.py) so every notebook uses the same definition.  ``abs_delta_bucket`` below
+# is the unsigned version for plots that pool calls and puts.
 
 
-def add_predictions(pairs: pd.DataFrame, models: dict) -> pd.DataFrame:
-    """Write ``delta_<name>`` columns for each fitted model in ``models``."""
-    pairs = pairs.copy()
+# Columns the evaluation needs; read only these from pairs.parquet to keep memory small:
+#   pd.read_parquet(path, columns=evaluate.EVAL_COLUMNS + model feature columns)
+EVAL_COLUMNS = ["type", "date", "year", "split", "dte", "delta", "dV", "dS", "delta_bucket", "ttm_class"]
+
+
+def add_predictions(pairs: pd.DataFrame, models: dict, inplace: bool = False) -> pd.DataFrame:
+    """Write ``delta_<name>`` columns for each fitted model in ``models``.
+
+    ``inplace=True`` avoids copying a multi-million-row table."""
+    if not inplace:
+        pairs = pairs.copy()
     for name, m in models.items():
-        pairs[f"delta_{name}"] = m.predict(pairs)
+        pairs[f"delta_{name}"] = m.predict(pairs).astype("float32")
     return pairs
 
 
@@ -42,14 +50,20 @@ def gain_table(pairs: pd.DataFrame, models: list[str], by: list[str] | None = No
         return pd.Series({m: gain_ratio(p, m) for m in models} | {"n": len(p)})
     if not by:
         return _one(pairs).to_frame("overall").T
-    return pairs.groupby(by, observed=True).apply(_one)
+    cols = [c for c in {"dV", "dS", "delta", *[f"delta_{m}" for m in models if m != "bs"]} if c in pairs]
+    return pairs.groupby(by, observed=True)[cols].apply(_one)
 
 
 def with_buckets(pairs: pd.DataFrame) -> pd.DataFrame:
-    """Add ``delta_bucket`` (0.1 ... 0.9, by |delta_BS|) and ``maturity_bucket`` columns."""
+    """Ensure the pipeline's bucket columns exist (recompute only if a frame lacks them) and add
+    ``abs_delta_bucket``."""
+    from .build_dataset import delta_bucket, ttm_class
     pairs = pairs.copy()
-    pairs["delta_bucket"] = np.clip(np.round(pairs["delta"].abs(), 1), 0.1, 0.9)
-    pairs["maturity_bucket"] = pd.cut(pairs["dte"], MATURITY_BINS, labels=MATURITY_LABELS, right=False)
+    if "delta_bucket" not in pairs:
+        pairs["delta_bucket"] = delta_bucket(pairs["delta"])
+    if "ttm_class" not in pairs:
+        pairs["ttm_class"] = ttm_class(pairs["dte"])
+    pairs["abs_delta_bucket"] = pairs["delta_bucket"].abs()
     return pairs
 
 
@@ -59,8 +73,8 @@ def standard_report(pairs: pd.DataFrame, models: list[str], out_dir: str | Path 
     tables = {
         "by_split_type": gain_table(p, models, ["split", "type"]),
         "by_year_type": gain_table(p.assign(year=p["date"].dt.year), models, ["year", "type"]),
-        "by_delta_bucket": gain_table(p, models, ["type", "delta_bucket"]),
-        "by_maturity": gain_table(p, models, ["type", "maturity_bucket"]),
+        "by_delta_bucket": gain_table(p, models, ["type", "abs_delta_bucket"]),
+        "by_maturity": gain_table(p, models, ["type", "ttm_class"]),
     }
     if out_dir is not None:
         out_dir = Path(out_dir); out_dir.mkdir(parents=True, exist_ok=True)
@@ -74,7 +88,7 @@ def crisis_window(pairs: pd.DataFrame, start="2020-02-19", end="2020-04-30") -> 
 
 
 def plot_gain_by_bucket(table: pd.DataFrame, models: list[str], title: str, ax=None):
-    """Line plot of gain ratio vs delta bucket, one line per model.  Expects ``gain_table(..., ['delta_bucket'])``."""
+    """Line plot of gain ratio vs delta bucket, one line per model.  Expects ``gain_table(..., ['abs_delta_bucket'])``."""
     import matplotlib.pyplot as plt
     ax = ax or plt.gca()
     for m in models:
