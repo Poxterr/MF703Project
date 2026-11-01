@@ -7,6 +7,12 @@ Run from the repo root, for example::
     python -m src.build_dataset --horizon 5           # weekly hedging pairs (5 trading days)
     python -m src.build_dataset --splits paper        # train 2010-17 / val 2018 / test 2019
     python -m src.build_dataset --stage pairs         # skip stage 1 if Parquet files already exist
+    python -m src.build_dataset --config configs/main_2016_2020.yaml   # every setting from one file
+
+A config file (YAML) is the recommended way to run: it pins years, horizon, filters, splits and
+vendor, and a copy is written next to the output so every pairs.parquet records how it was made.
+Command-line flags override the file.  A new year, a different filter set or another vendor's
+files is a new config, not a code change.
 
 What it produces (all under data/processed/):
 
@@ -58,21 +64,23 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from src import load as L   # the team's parsing / filtering code - reused, not copied
+from src import checks as C  # hard input checks (wrong vendor, wrong units, misnamed file)
+from src.schema import (KEY, FEATURES, SENTIMENT, OPTION_DAY_SCHEMA, PAIRS_SCHEMA,
+                        assert_schema, conform)
 
 # --------------------------------------------------------------------------- #
 # 0. Configuration                                                            #
 # --------------------------------------------------------------------------- #
-KEY = ["type", "expiry", "strike"]            # what identifies one contract in optionsDX files
-FEATURES = ["T", "delta", "moneyness", "iv", "theta", "vega", "gamma"]   # Qiao & Wan, Table 2
-SENTIMENT = ["index_ret", "vix"]              # Chen & Li (2023) "Fea3-CL" extras
+# KEY, FEATURES and SENTIMENT are defined once in src/schema.py and imported above.
 
 # Named split sets (inclusive year ranges).  Chronological on purpose: the same contract
 # appears on consecutive days, so a random split would leak tomorrow into today.
 SPLIT_SETS = {
     "paper":  {"train": (2010, 2017), "val": (2018, 2018), "test": (2019, 2019)},   # mirrors the paper's window
     "modern": {"train": (2010, 2019), "val": (2020, 2020), "test": (2021, 2023)},   # the regimes the paper never saw
-    "readme": {"train": (2016, 2018), "val": (2019, 2019), "test": (2020, 2020)},   # the repo's original split
+    "proposal": {"train": (2016, 2018), "val": (2019, 2019), "test": (2020, 2020)},  # the approved proposal: 2020 is the crisis test
 }
+SPLIT_SETS["readme"] = SPLIT_SETS["proposal"]   # old name, kept so existing commands still work
 
 
 @dataclass
@@ -81,10 +89,33 @@ class BuildConfig:
     out_dir: Path = Path("data/processed")
     years: list[int] | None = None            # None = every year found under raw_dir
     horizon: int = 1                          # hedging interval in TRADING days (1 = daily, 5 ~ weekly, 21 ~ monthly)
-    splits: str = "modern"
+    splits: str | dict = "proposal"           # a name in SPLIT_SETS, or an explicit {name: (y0, y1)} dict
+    vendor: str = "optionsdx"                 # key into load.COLUMN_MAPS / load.VENDOR_UNITS
     filters: L.FilterConfig = field(default_factory=L.FilterConfig)
     vix_csv: Path | None = None               # optional FRED VIXCLS.csv for the Chen-Li call feature
     min_abs_ds: float = 0.0                   # drop pairs where the index did not move at all
+    config_path: Path | None = None           # the YAML this run came from, if any (copied to out_dir)
+
+    def split_years(self) -> dict:
+        return SPLIT_SETS[self.splits] if isinstance(self.splits, str) else {k: tuple(v) for k, v in self.splits.items()}
+
+
+def load_config(path: str | Path) -> dict:
+    """Read a YAML config into a flat dict of BuildConfig / FilterConfig fields."""
+    import yaml
+    with open(path) as f:
+        cfg = yaml.safe_load(f) or {}
+    return cfg
+
+
+def config_from_dict(d: dict, config_path: Path | None = None) -> BuildConfig:
+    """Build a BuildConfig from a dict such as a parsed YAML file."""
+    filt = L.FilterConfig(**d.get("filters", {}))
+    kw = {k: v for k, v in d.items() if k in BuildConfig.__dataclass_fields__ and k not in ("filters", "config_path")}
+    for k in ("raw_dir", "out_dir", "vix_csv"):
+        if kw.get(k) is not None:
+            kw[k] = Path(kw[k])
+    return BuildConfig(filters=filt, config_path=config_path, **kw)
 
 
 # --------------------------------------------------------------------------- #
@@ -138,12 +169,16 @@ def clean_file(path: Path, cfg: BuildConfig, cal: pd.DatetimeIndex) -> tuple[pd.
     order of operations is visible: parse -> long -> calendar -> filters.
     """
     raw = L.read_raw(path)                                 # vendor text, bracketed headers removed
-    long = L.to_long(raw)                                  # one row per option, standard column names
+    C.check_vendor_columns(raw, L.required_columns(cfg.vendor), path)   # wrong vendor -> stop
+    long = L.to_long(raw, cfg.vendor)                      # one row per option, standard column names
+    C.check_dates_match_filename(long, path)               # misnamed / concatenated file -> stop
 
     # (a) rows dated on days the exchange was closed -> drop, but remember them
     on_cal = long["date"].isin(cal)
     non_trading_dates = sorted(long.loc[~on_cal, "date"].dt.date.unique())
     long = long[on_cal]
+    C.check_not_empty(long, path, "the exchange-calendar filter")
+    units = C.check_greek_units(long, path)                # vega per 1%? IV in percent? -> stop
 
     # (b) days where the vendor shows bid = 0 on every option (Jan-Feb 2010): the bid > 0
     #     filter removes the whole day, so flag it rather than let it vanish silently
@@ -157,8 +192,10 @@ def clean_file(path: Path, cfg: BuildConfig, cal: pd.DatetimeIndex) -> tuple[pd.
 
     # (d) the sample filters (dte >= 14, 0.05 <= |delta| <= 0.95, bid > 0, ...)
     filtered = L.apply_filters(long, cfg.filters)
+    assert_schema(filtered, OPTION_DAY_SCHEMA, path.name)  # the stage-1 contract
 
     rep = L.validate(raw, long, filtered, path.name)        # the team's standard report row ...
+    rep.update(units)
     rep.update({                                           # ... plus the calendar findings
         "non_trading_rows_dropped": int((~on_cal).sum()),
         "non_trading_dates": ";".join(map(str, non_trading_dates)),
@@ -174,6 +211,7 @@ def run_stage1(cfg: BuildConfig, cal: pd.DatetimeIndex) -> pd.DataFrame:
     if not files:
         raise SystemExit(f"no raw files under {cfg.raw_dir} for years={cfg.years}")
     cfg.out_dir.mkdir(parents=True, exist_ok=True)
+    write_run_config(cfg)
     rows = []
     t0 = time.time()
     for p in files:
@@ -191,6 +229,18 @@ def run_stage1(cfg: BuildConfig, cal: pd.DatetimeIndex) -> pd.DataFrame:
     write_quality_md(report, cfg.out_dir / "data_quality.md")
     print(f"stage 1: {len(files)} files cleaned in {time.time() - t0:.0f}s")
     return report
+
+
+def write_run_config(cfg: BuildConfig) -> None:
+    """Record exactly how this dataset was built, next to the data."""
+    import yaml
+    d = {"years": cfg.years, "horizon": cfg.horizon, "vendor": cfg.vendor,
+         "splits": {k: list(v) for k, v in cfg.split_years().items()},
+         "filters": cfg.filters.__dict__, "min_abs_ds": cfg.min_abs_ds,
+         "vix_csv": str(cfg.vix_csv) if cfg.vix_csv else None,
+         "source_config": str(cfg.config_path) if cfg.config_path else None,
+         "built": time.strftime("%Y-%m-%d %H:%M")}
+    (cfg.out_dir / "build_config.yaml").write_text(yaml.safe_dump(d, sort_keys=False))
 
 
 def write_quality_md(report: pd.DataFrame, path: Path) -> None:
@@ -287,6 +337,35 @@ def _pair_one_side(left: pd.DataFrame, nxt: pd.DataFrame, cal: pd.DatetimeIndex,
     return pairs
 
 
+def pair_frame(df: pd.DataFrame, cal: pd.DatetimeIndex | None = None, horizon: int = 1,
+               splits: str | dict = "proposal", vix: pd.Series | None = None) -> pd.DataFrame:
+    """Pair an in-memory option-day frame (e.g. a Heston simulation, or a test fixture).
+
+    Same arithmetic and columns as the file-based stage 2, for one frame that fits in memory.
+    ``cal`` defaults to the NYSE calendar; for simulated data pass the simulation's own dates.
+    """
+    cal = trading_days() if cal is None else pd.DatetimeIndex(cal)
+    cfg = BuildConfig(horizon=horizon, splits=splits)
+    split_years = cfg.split_years()
+    index_ret = index_log_return([df], cal)
+    out = []
+    for side in ("C", "P"):
+        part = df[df["type"] == side]
+        if part.empty:
+            continue
+        pairs = _pair_one_side(part, part.iloc[0:0], cal, cfg)
+        pairs["type"] = pairs["type"].astype("category")
+        pairs["year"] = pairs["date"].dt.year
+        pairs["delta_bucket"] = delta_bucket(pairs["delta"])
+        pairs["ttm_class"] = ttm_class(pairs["dte"])
+        pairs["index_ret"] = pairs["date"].map(index_ret)
+        pairs["vix"] = pairs["date"].map(vix) if vix is not None else np.nan
+        assign_splits(pairs, split_years)
+        out.append(pairs)
+    pairs = pd.concat(out, ignore_index=True) if out else pd.DataFrame(columns=list(PAIRS_SCHEMA))
+    return conform(pairs, PAIRS_SCHEMA)
+
+
 def index_log_return(frames: list[pd.DataFrame], cal: pd.DatetimeIndex) -> pd.Series:
     """Daily index log-return log(S_t / S_{t-1}) on the trading calendar, indexed by t.
 
@@ -342,6 +421,8 @@ def build_pairs_year(year: int, cfg: BuildConfig, cal: pd.DatetimeIndex, vix: pd
         pairs["index_ret"] = pairs["date"].map(index_ret)
         pairs["vix"] = pairs["date"].map(vix) if vix is not None else np.nan
         assign_splits(pairs, splits)
+        pairs = conform(pairs, PAIRS_SCHEMA)
+        assert_schema(pairs, PAIRS_SCHEMA, f"pairs {year} {side}")   # the stage-2 contract
 
         table = pa.Table.from_pandas(pairs, preserve_index=False)
         if writer is None:
@@ -391,7 +472,7 @@ def _single_path(cfg: BuildConfig) -> Path:
 def run_stage2(cfg: BuildConfig, cal: pd.DatetimeIndex, merge: bool = True) -> pd.DataFrame:
     """Build pairs year by year (one Parquet per year), then merge them into one file."""
     years = cfg.years or sorted({int(p.stem[8:12]) for p in cfg.out_dir.glob("spx_eod_*.parquet")})
-    splits = SPLIT_SETS[cfg.splits]
+    splits = cfg.split_years()
     vix = load_vix(cfg.vix_csv)
     parts_dir = _parts_dir(cfg)
     parts_dir.mkdir(parents=True, exist_ok=True)
@@ -415,7 +496,8 @@ def run_stage2(cfg: BuildConfig, cal: pd.DatetimeIndex, merge: bool = True) -> p
     summary = summary.sort_values("year").reset_index(drop=True)
     summary.to_csv(sum_path, index=False)
     (cfg.out_dir / f"pairs_h{cfg.horizon}_meta.json").write_text(json.dumps({
-        "horizon_trading_days": cfg.horizon, "splits": cfg.splits, "split_years": splits,
+        "horizon_trading_days": cfg.horizon, "vendor": cfg.vendor,
+        "splits": cfg.splits if isinstance(cfg.splits, str) else "custom", "split_years": splits,
         "filters": cfg.filters.__dict__, "vix": str(cfg.vix_csv) if cfg.vix_csv else None,
         "features": FEATURES, "sentiment": SENTIMENT, "key": KEY,
         "built": time.strftime("%Y-%m-%d %H:%M"),
@@ -450,27 +532,37 @@ def run_merge(cfg: BuildConfig) -> Path:
 # --------------------------------------------------------------------------- #
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--config", default=None, help="YAML config (configs/*.yaml); flags given here override it")
+    ap.add_argument("--vendor", default=None, choices=list(L.COLUMN_MAPS), help="raw file layout (default optionsdx)")
     ap.add_argument("--stage", choices=["all", "clean", "pairs", "merge"], default="all",
                     help="all = clean + pairs + merge; merge = only stitch existing year parts into pairs.parquet")
     ap.add_argument("--no-merge", action="store_true", help="with --stage pairs: write year parts only")
-    ap.add_argument("--raw-dir", default="data/raw")
-    ap.add_argument("--out", default="data/processed")
-    ap.add_argument("--years", nargs="*", type=int, help="e.g. --years 2019 2020 (default: all found)")
-    ap.add_argument("--horizon", type=int, default=1, help="hedging interval in trading days (1, 5, 21)")
-    ap.add_argument("--splits", choices=list(SPLIT_SETS), default="modern")
+    ap.add_argument("--raw-dir", default=None)
+    ap.add_argument("--out", default=None)
+    ap.add_argument("--years", nargs="*", type=int, default=None, help="e.g. --years 2019 2020 (default: all found)")
+    ap.add_argument("--horizon", type=int, default=None, help="hedging interval in trading days (1, 5, 21)")
+    ap.add_argument("--splits", choices=list(SPLIT_SETS), default=None)
     ap.add_argument("--traded-only", action="store_true", help="keep only quotes with volume > 0 (the paper's sample)")
-    ap.add_argument("--min-dte", type=float, default=14.0)
-    ap.add_argument("--min-delta", type=float, default=0.05)
-    ap.add_argument("--max-delta", type=float, default=0.95)
+    ap.add_argument("--min-dte", type=float, default=None)
+    ap.add_argument("--min-delta", type=float, default=None)
+    ap.add_argument("--max-delta", type=float, default=None)
     ap.add_argument("--vix", default=None, help="FRED VIXCLS.csv (adds the Chen-Li VIX feature)")
     a = ap.parse_args(argv)
 
-    cfg = BuildConfig(
-        raw_dir=Path(a.raw_dir), out_dir=Path(a.out), years=a.years, horizon=a.horizon, splits=a.splits,
-        filters=L.FilterConfig(min_dte=a.min_dte, min_abs_delta=a.min_delta, max_abs_delta=a.max_delta,
-                               require_volume=a.traded_only),
-        vix_csv=Path(a.vix) if a.vix else None,
-    )
+    d = load_config(a.config) if a.config else {}
+    d.setdefault("filters", {})
+    for flag, key in (("raw_dir", "raw_dir"), ("out", "out_dir"), ("years", "years"), ("horizon", "horizon"),
+                      ("splits", "splits"), ("vendor", "vendor"), ("vix", "vix_csv")):
+        if getattr(a, flag) is not None:
+            d[key] = getattr(a, flag)
+    for flag, key in (("min_dte", "min_dte"), ("min_delta", "min_abs_delta"), ("max_delta", "max_abs_delta")):
+        if getattr(a, flag) is not None:
+            d["filters"][key] = getattr(a, flag)
+    if a.traded_only:
+        d["filters"]["require_volume"] = True
+    cfg = config_from_dict(d, Path(a.config) if a.config else None)
+    print(f"build: years={cfg.years or 'all'} horizon={cfg.horizon} splits={cfg.split_years()} "
+          f"vendor={cfg.vendor} filters={cfg.filters}")
     cal = trading_days()
     if a.stage in ("all", "clean"):
         run_stage1(cfg, cal)

@@ -41,3 +41,30 @@ This is a result to report, not a bug to hide.
   never traded). The paper's sample is the `--traded-only` run; build both before comparing to it.
 - 2020 benchmark MSE (82) is ~20x 2019 (4.6): the crisis year dominates any pooled gain ratio;
   report by year.
+
+## Stage 1 consolidated (2026-11-01)
+
+- One pipeline: `src/build_dataset.py` (Owen's calendar-correct version) is the only loader/pairer;
+  `src/pairs.py` is gone. `src/schema.py` holds the two output schemas and the shared identifiers
+  (KEY, FEATURES, SENTIMENT); `src/checks.py` holds the hard input checks.
+- Builds are driven by YAML configs in `configs/`; `build_config.yaml` is written next to each output.
+- Default split is the proposal's (train 2016-18 / val 2019 / test 2020). `paper` and `modern` remain available.
+- Full 2016-2020 build: 5,419,731 pairs, 82 s. Numbers and findings in `docs/data_pipeline.md`.
+
+### First baselines on the full 2016-2020 dataset (sanity check, not tuned)
+
+Hull-White and a LightGBM residual model fitted on 2016-18 (GBM early-stopped on 2019), gain ratio
+vs the implied Black-Scholes delta:
+
+| | HW calls | HW puts | GBM calls | GBM puts |
+|---|---|---|---|---|
+| val 2019 | 0.033 | 0.029 | 0.019 | 0.093 |
+| test 2020 | 0.190 | 0.036 | 0.164 | 0.107 |
+| Feb-Apr 2020 | 0.215 | 0.042 | 0.190 | 0.117 |
+
+Positive out of sample in every year once the training window is three years (the 9-month 2016-only
+experiment above went negative). Well below the paper's 0.3-0.6, which used the traded-only sample
+and nine training years; run `configs/traded_only_2016_2020.yaml` before comparing.
+Hull-White coefficients on the training years: calls (-0.08, -0.15, 0.14), puts (-0.12, -0.37, -0.27).
+Memory: load `pairs.parquet` with `columns=` (see `evaluate.EVAL_COLUMNS`) and cast to float32;
+the full 35-column table is ~3 GB in pandas.

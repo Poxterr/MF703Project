@@ -18,17 +18,18 @@ Extensions beyond the paper: a Heston known-model check, transaction costs, the 
 ## Pipeline
 
 ```
-raw vendor files ──► src/load.py ──► data/processed/*.parquet ──► src/pairs.py ──► pairs.parquet
-                        (clean, filter, validate)                   (next-day pairing, target, split)
-                                                                             │
-                   src/models.py  (fit / predict)  ◄────────────────────────┘
-                        │
-                   src/evaluate.py (gain ratios by split, year, delta bucket, maturity)
-                        │
-                   src/costs.py  ·  src/heston.py   (extensions)
+data/raw/<year>/*.txt ──► src/build_dataset.py ──► data/processed/pairs.parquet
+                          stage 1: parse, calendar-check, hard input checks, filter, validate  (src/load.py, src/checks.py, src/schema.py)
+                          stage 2: pair each contract with itself h trading days later on the NYSE calendar; target, buckets, split
+                                   │
+                  src/models.py  (fit / predict)  ◄── one table, one interface
+                                   │
+                  src/evaluate.py (gain ratios by split, year, delta bucket, maturity)
+                                   │
+                  src/costs.py  ·  src/heston.py   (extensions)
 ```
 
-Each stage reads the previous stage's file, so the four workstreams can run in parallel once `pairs.parquet` exists.
+One command builds the dataset from a config file (`configs/`); a copy of the settings is saved next to the output. Details, data-quality findings and per-year counts: `docs/data_pipeline.md`.
 
 ## Setup
 
@@ -42,19 +43,19 @@ Put the raw vendor files in `data/raw/<year>/` (see `data/README.md`; they are g
 ## Run
 
 ```bash
-# Stage 1: clean every raw file into Parquet, with a quality report
-python -m src.load --out data/processed          # all years under data/raw/
-python -m src.load --years 2016 --out data/processed   # one year
+# Stages 1 + 2 from the project config: 2016-2020, one-day horizon, train 2016-18 / val 2019 / test 2020
+python -m src.build_dataset --config configs/main_2016_2020.yaml
 
-# Stage 2: build the pairs table with train/val/test split
-python -m src.pairs data/processed --out data/processed/pairs.parquet
+# variants (see configs/README.md)
+python -m src.build_dataset --config configs/traded_only_2016_2020.yaml
+python -m src.build_dataset --years 2016 --out data/processed      # one year, flags override the config
 ```
 
 Then open the notebooks in order:
 
 | Notebook | Owner | Contents |
 |---|---|---|
-| `01_data.ipynb` | data | runs stages 1–2, data-quality checks, descriptive figures |
+| `01_data.ipynb` | data | runs the pipeline from the config, data-quality report, benchmark error by year |
 | `02_baselines.ipynb` | baselines | Black-Scholes vs Hull-White vs GBM, gain-ratio tables and plots |
 | `03_neural.ipynb` | ML | direct and residual networks, training curves, 2019/2020 results |
 | `04_heston.ipynb` | simulation | Heston simulation, known-truth correction vs learned correction |
@@ -63,8 +64,9 @@ Then open the notebooks in order:
 ## Conventions
 
 - Option price = bid-ask midpoint. Hedging error = `dV - delta * dS` in index points per option.
-- Filters (defaults in `load.FilterConfig`): DTE ≥ 14, 0.05 ≤ |delta| ≤ 0.95, bid > 0. `--traded-only` gives the volume > 0 subsample.
-- Splits are chronological and set in `pairs.DEFAULT_SPLITS`: train 2016–18, val 2019, test 2020. Never random-split: the same contract appears on consecutive days.
+- Filters (defaults in `load.FilterConfig`, set per config): DTE ≥ 14, 0.05 ≤ |delta| ≤ 0.95, bid > 0, bid ≤ ask. `require_volume: true` / `--traded-only` gives the volume > 0 subsample.
+- Pairing uses the NYSE calendar (`pandas_market_calendars`): a day missing from the vendor files drops a pair, never bridges one.
+- Splits are chronological and set in the config (default `proposal`: train 2016–18, val 2019, test 2020; also `paper` and `modern` in `build_dataset.SPLIT_SETS`). Never random-split: the same contract appears on consecutive days.
 - Every model exposes `fit(pairs)` / `predict(pairs)` and writes a `delta_<name>` column; `evaluate.gain_ratio` reads those columns.
 - Figures go to `figures/`, tables to `tables/`, with stable filenames so the report can reference them.
 
@@ -74,7 +76,7 @@ Then open the notebooks in order:
 pytest tests/
 ```
 
-The tests run on a tiny synthetic file and check the loader schema, the pairing arithmetic, and that Hull-White and the gain ratio reproduce known values.
+Twelve tests on synthetic vendor files: parsing, filters, the units and schema checks, calendar handling (gaps drop pairs, holiday rows are removed), pairing arithmetic, an end-to-end build from a config, Hull-White recovery and the gain ratio. GitHub Actions runs them on every pull request.
 
 ## References
 

@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
-from .pairs import FEATURES
+from .schema import FEATURES
 
 
 class HedgeModel:

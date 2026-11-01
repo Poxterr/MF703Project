@@ -1,0 +1,15 @@
+# Weekly hedging (5 trading days between legs), as in the paper's Tables 5-6.
+years: [2016, 2017, 2018, 2019, 2020]
+horizon: 5
+vendor: optionsdx
+splits:
+  train: [2016, 2018]
+  val:   [2019, 2019]
+  test:  [2020, 2020]
+filters:
+  min_dte: 14
+  min_abs_delta: 0.05
+  max_abs_delta: 0.95
+  require_positive_bid: true
+  require_volume: false
+  drop_crossed: true
