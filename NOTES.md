@@ -20,3 +20,24 @@ in the test window. Expect:
 - the 2020 test year to be the hard case the proposal says it is.
 
 This is a result to report, not a bug to hide.
+
+## 2010-2023 data loaded and paired (2026-10-31)
+
+- Raw: 168 optionsDX monthly files in `data/raw/<year>/spx_eod_YYYYMM.txt` (5.3 GB, not in git).
+  2024 was not downloaded. The 2013 download folder was duplicated byte-for-byte; one copy kept.
+- New entry point `src/build_dataset.py` runs stage 1 + stage 2 + merge in one go:
+  `python -m src.build_dataset` (all years, 1-day horizon, "modern" splits). See its docstring.
+  Needs `pandas_market_calendars` (added to requirements.txt).
+- Result: 13,192,861 one-day pairs in `data/processed/pairs.parquet` (803 MB); per-year files in
+  `data/processed/pairs_h1_parts/`; counts and benchmark MSE by year in `pairs_h1_summary.csv`;
+  every missing/dropped day in `data_quality.md`.
+- Vendor problems found and handled (details in data_quality.md):
+  * 35 NYSE trading days are absent from the files (e.g. 2011-01-19..25, 2019-03-01, 2022-06-17).
+  * 8 days in Jan-Feb 2010 have bid = 0 on every option (filtered out entirely).
+  * 2022 files contain rows on all 9 exchange holidays; 2012 has Hurricane Sandy days; 2018 has 5 Dec.
+  Pairs are now built on the NYSE calendar: t+1 is the real next trading day, so a gap drops the
+  pair instead of silently creating a two-day move (the old `pairs.py` bridged gaps).
+- Filter note: with the default bid > 0 filter, calls pile up in the 0.9 delta bucket (deep ITM,
+  never traded). The paper's sample is the `--traded-only` run; build both before comparing to it.
+- 2020 benchmark MSE (82) is ~20x 2019 (4.6): the crisis year dominates any pooled gain ratio;
+  report by year.
