@@ -1,0 +1,16 @@
+# The project's primary dataset: the sample approved in the proposal.
+# Run:  python -m src.build_dataset --config configs/main_2016_2020.yaml
+years: [2016, 2017, 2018, 2019, 2020]
+horizon: 1                      # trading days between the two legs of a hedge
+vendor: optionsdx
+splits:                         # chronological; 2020 is the held-out crisis year
+  train: [2016, 2018]
+  val:   [2019, 2019]
+  test:  [2020, 2020]
+filters:
+  min_dte: 14
+  min_abs_delta: 0.05
+  max_abs_delta: 0.95
+  require_positive_bid: true
+  require_volume: false         # all quoted options; see traded_only_2016_2020.yaml for the paper's sample
+  drop_crossed: true
