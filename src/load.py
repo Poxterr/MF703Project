@@ -32,25 +32,7 @@ from typing import Iterable
 import numpy as np
 import pandas as pd
 
-# --------------------------------------------------------------------------- #
-# Standard output schema                                                      #
-# --------------------------------------------------------------------------- #
-# Every loader, whatever the vendor, produces a frame with exactly these columns.
-STANDARD_COLUMNS = [
-    "date",        # quote date (datetime64)
-    "expiry",      # expiry date (datetime64)
-    "type",        # "C" or "P"
-    "strike",      # float
-    "S",           # underlying close
-    "dte",         # calendar days to expiry (float, as the vendor reports it)
-    "T",           # years to expiry = dte / 365
-    "bid", "ask", "mid",
-    "last", "volume",
-    "bid_size", "ask_size",
-    "iv",          # implied volatility (decimal)
-    "delta", "gamma", "vega", "theta", "rho",
-    "moneyness",   # S / K
-]
+from .schema import OPTION_DAY_COLUMNS as STANDARD_COLUMNS  # the output schema lives in schema.py
 
 # Vendor column names -> standard names, per option side.  Add a new vendor here.
 COLUMN_MAPS = {
@@ -74,6 +56,12 @@ COLUMN_MAPS = {
         },
     },
 }
+
+
+def required_columns(vendor: str = "optionsdx") -> set[str]:
+    """Raw column names a file must have to be parsed as ``vendor``."""
+    cmap = COLUMN_MAPS[vendor]
+    return set(cmap["common"]) | set(cmap["C"]) | set(cmap["P"])
 
 
 # Unit conventions per vendor.  Checked on the 2016 files: vega is per 1% vol,
@@ -129,7 +117,8 @@ def to_long(raw: pd.DataFrame, vendor: str = "optionsdx") -> pd.DataFrame:
     df["expiry"] = pd.to_datetime(df["expiry"])
     for c in ["strike", "S", "dte", "bid", "ask", "last", "volume",
               "iv", "delta", "gamma", "vega", "theta", "rho"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
+        df[c] = pd.to_numeric(df[c], errors="coerce").astype("float64")   # explicit: never int64
+    df["type"] = df["type"].astype("string")
     df["volume"] = df["volume"].fillna(0.0)
     # Vendor Greek units -> textbook units.  The vendor quotes vega per 1 percentage
     # point of volatility (ATM 30-day SPX vega ~ 2.4); Black-Scholes vega per unit of

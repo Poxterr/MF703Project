@@ -4,6 +4,10 @@ data/processed/**
 !data/raw/*/
 !data/raw/*/.gitkeep
 !data/processed/.gitkeep
+!data/processed/load_report.csv
+!data/processed/data_quality.md
+!data/processed/pairs_h1_summary.csv
+!data/processed/build_config.yaml
 !data/README.md
 
 # python

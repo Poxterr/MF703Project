@@ -1,0 +1,17 @@
+# Replication window of Qiao & Wan (2024): train on 2010-2017, validate 2018, test 2019.
+# Needs the 2010-2015 raw files under data/raw/<year>/ as well.
+years: [2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017, 2018, 2019]
+horizon: 1
+vendor: optionsdx
+out_dir: data/processed_paper
+splits:
+  train: [2010, 2017]
+  val:   [2018, 2018]
+  test:  [2019, 2019]
+filters:
+  min_dte: 14
+  min_abs_delta: 0.05
+  max_abs_delta: 0.95
+  require_positive_bid: true
+  require_volume: true
+  drop_crossed: true

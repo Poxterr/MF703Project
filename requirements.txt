@@ -11,3 +11,4 @@ seaborn>=0.13
 jupyter
 pytest
 pandas_market_calendars>=4.0
+pyyaml>=6.0

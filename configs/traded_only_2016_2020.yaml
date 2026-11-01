@@ -1,0 +1,18 @@
+# Robustness sample: only options that actually traded on day t (volume > 0).
+# This is closer to the sample in Hull & White (2017) and Qiao & Wan (2024).
+# Write to its own folder so it does not overwrite the main dataset.
+years: [2016, 2017, 2018, 2019, 2020]
+horizon: 1
+vendor: optionsdx
+out_dir: data/processed_traded_only
+splits:
+  train: [2016, 2018]
+  val:   [2019, 2019]
+  test:  [2020, 2020]
+filters:
+  min_dte: 14
+  min_abs_delta: 0.05
+  max_abs_delta: 0.95
+  require_positive_bid: true
+  require_volume: true
+  drop_crossed: true
