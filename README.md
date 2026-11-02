@@ -38,6 +38,14 @@ conda create -n mf703 python=3.11 -y && conda activate mf703
 pip install -r requirements.txt
 ```
 
+## Using pip venv
+```
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+```
+
+
 Put the raw vendor files in `data/raw/<year>/` (see `data/README.md`; they are git-ignored, ~25 MB per month).
 
 ## Run
