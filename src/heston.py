@@ -92,7 +92,7 @@ def simulate_path(p: HestonParams, n_days: int, S0: float = 3000.0, dt: float = 
         S[t + 1] = S[t] * np.exp((p.mu - 0.5 * vp) * dt + np.sqrt(vp * dt) * z1)
         v[t + 1] = v[t] + p.kappa * (p.theta - vp) * dt + p.xi * np.sqrt(vp * dt) * z2
     dates = pd.bdate_range("2016-01-04", periods=n_days + 1)
-    return pd.DataFrame({"date": dates, "S": S, "v": v})
+    return pd.DataFrame({"date": dates, "S": S, "v": np.maximum(v, 0.0)})
 
 
 def simulate_chain(p: HestonParams = HestonParams(), n_days: int = 1000, seed: int = 0,
