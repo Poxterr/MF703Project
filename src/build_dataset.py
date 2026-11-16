@@ -511,6 +511,8 @@ def run_stage2(cfg: BuildConfig, cal: pd.DatetimeIndex, merge: bool = True) -> p
 def run_merge(cfg: BuildConfig) -> Path:
     """Stream every year part into one pairs.parquet without loading all years into memory."""
     parts = sorted(_parts_dir(cfg).glob("year=*.parquet"))
+    if cfg.years is not None:
+        parts = [p for p in parts if int(p.stem.split("=")[1]) in cfg.years]
     if not parts:
         raise SystemExit(f"no year parts in {_parts_dir(cfg)}; run --stage pairs first")
     single = _single_path(cfg)
