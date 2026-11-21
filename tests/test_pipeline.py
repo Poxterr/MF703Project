@@ -441,3 +441,52 @@ def test_neural_hedger_runs():
     m = models.NeuralHedger(residual=True, hidden=(16,), max_epochs=5, patience=5).fit(p, val=p)
     out = m.predict(p)
     assert out.shape == (n,) and np.isfinite(out).all()
+
+
+# --------------------------------------------------------------------------- #
+# Transaction costs                                                           #
+# --------------------------------------------------------------------------- #
+def _cost_pairs():
+    """One call quoted on four days with a gap after the second: two episodes of two days each."""
+    d = pd.to_datetime(["2020-01-02", "2020-01-03", "2020-01-07", "2020-01-08"])
+    nxt = pd.to_datetime(["2020-01-03", "2020-01-06", "2020-01-08", "2020-01-09"])
+    return pd.DataFrame({
+        "type": "C", "expiry": pd.Timestamp("2020-03-20"), "strike": 3000.0,
+        "date": d, "date_next": nxt, "S": [3000.0, 3010.0, 3020.0, 3000.0],
+        "dS": [10.0, -5.0, -20.0, 10.0], "dV": [6.0, -2.0, -9.0, 4.0],
+        "delta": [0.5, 0.6, 0.55, 0.45],
+    })
+
+
+def test_costs_episodes_split_on_gap():
+    from src import costs
+    p = costs.sort_for_episodes(_cost_pairs().sample(frac=1, random_state=0))   # order must not matter
+    assert p["episode"].tolist() == [0, 0, 1, 1]
+    pnl = costs.hedge_pnl(p, ["delta"], cost_bp=0, min_days=1)
+    assert pnl["n_days"].tolist() == [2, 2]
+    # a subset of episodes (ids no longer 0..k-1) must still work
+    only = costs.hedge_pnl(p[p["episode"] == 1], ["delta"], cost_bp=0, min_days=1)
+    assert len(only) == 1 and only.loc[0, "pnl_delta"] == pytest.approx(pnl.loc[1, "pnl_delta"])
+
+
+def test_costs_known_numbers():
+    from src import costs
+    p = _cost_pairs()
+    pnl = costs.hedge_pnl(p, ["delta"], cost_bp=10, min_days=1)        # c = 1e-3
+    # episode 0: gross = (-6 + 0.5*10) + (2 + 0.6*-5) = -2 ; trades 0.5 @3000, 0.1 @3010, unwind 0.6 @3005
+    assert pnl.loc[0, "pnl_delta"] == pytest.approx(-2.0 - 1e-3 * (0.5 * 3000 + 0.1 * 3010 + 0.6 * 3005))
+    assert pnl.loc[0, "turnover_delta"] == pytest.approx(0.5 + 0.1 + 0.6)
+    assert pnl.loc[0, "rebal_delta"] == pytest.approx(0.1)
+    # episode 1 sets up from zero again: 0.55, then 0.10, then unwind 0.45
+    assert pnl.loc[1, "turnover_delta"] == pytest.approx(0.55 + 0.10 + 0.45)
+    assert pnl.loc[1, "cost_delta"] == pytest.approx(1e-3 * (0.55 * 3020 + 0.10 * 3000 + 0.45 * 3010))
+
+
+def test_costs_zero_cost_gain_matches_evaluate():
+    from src import costs, evaluate
+    p = _cost_pairs()
+    p["delta_m"] = p["delta"] - 0.05
+    g0 = costs.net_gain(p, ["m"], bps=(0,)).loc[0, "m"]
+    assert g0 == pytest.approx(evaluate.gain_ratio(p, "m"))
+    by = costs.net_gain(p, ["m"], bps=(0, 5), by=["type"])
+    assert by.loc[(0, "C"), "m"] == pytest.approx(g0)

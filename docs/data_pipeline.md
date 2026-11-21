@@ -154,7 +154,7 @@ pip install -r requirements.txt
 python -m src.build_dataset --config configs/main_2016_2020.yaml     # the project dataset
 python -m src.build_dataset --config configs/traded_only_2016_2020.yaml
 python -m src.build_dataset --years 2021 --out data/processed          # add a year to an existing build
-pytest tests/                                                          # 20 tests, a few seconds
+pytest tests/                                                          # 26 tests, a few seconds
 ```
 
 Tests run on synthetic vendor files and cover parsing, filters, the units and schema checks, the
