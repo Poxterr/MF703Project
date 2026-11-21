@@ -1,0 +1,10 @@
+model,kind,inputs,output_scale,epochs,val_C,val_P,test_C,test_P,crisis_C,crisis_P,q3_C,q3_P
+sf7_resid,residual,scale-free 7,none,13,0.0942,0.1281,-0.1574,-0.2099,-0.2064,-0.2730,-0.0044,0.0015
+min3_resid,residual,"T, delta, iv",none,19,0.0870,0.1534,-0.0832,-0.0775,-0.1117,-0.1154,-0.0151,-0.0072
+raw7_resid_hw,residual,paper 7,hw,7,0.0789,0.0675,0.0702,0.0503,0.0667,0.0469,-0.0180,0.0120
+sf7_resid_hw,residual,scale-free 7,hw,18,0.0980,0.1285,-0.1366,-0.1540,-0.1655,-0.1896,0.0118,0.0200
+min3_resid_hw,residual,"T, delta, iv",hw,17,0.0890,0.1458,-0.2126,-0.1838,-0.2783,-0.2443,-0.0073,-0.0038
+td2_resid_hw,residual,"T, delta",hw,14,0.0731,0.1308,0.1668,0.0954,0.1878,0.1052,-0.0455,-0.0097
+raw7_resid_clip3,"residual, inputs clipped at 3 sd",paper 7,none,13,0.0955,0.1355,-0.1266,-0.0482,-0.1659,-0.0697,-0.0340,-0.0181
+sf7_direct,direct,scale-free 7,none,12,0.0873,0.1591,-0.0892,-1.0879,-0.1141,-1.3372,-0.0008,-0.1338
+min3_direct,direct,"T, delta, iv",none,10,0.0794,0.1541,-0.5567,-1.4304,-0.6911,-1.7975,-0.0031,-0.0816
