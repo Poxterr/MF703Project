@@ -82,6 +82,8 @@ class FilterConfig:
     require_volume: bool = False   # True = traded-only subsample (robustness check)
     drop_crossed: bool = True      # bid > ask
     max_rel_spread: float | None = None  # e.g. 0.5 to drop spreads wider than 50% of mid
+    require_valid_greeks: bool = True    # drop rows whose vendor Greeks are impossible (see greeks_valid)
+    max_vega_mismatch: float | None = 2.0  # allowed factor between vendor vega and Black-Scholes vega; None = skip
 
 
 # --------------------------------------------------------------------------- #
@@ -133,9 +135,62 @@ def to_long(raw: pd.DataFrame, vendor: str = "optionsdx") -> pd.DataFrame:
 # --------------------------------------------------------------------------- #
 # Filtering and validation                                                    #
 # --------------------------------------------------------------------------- #
+def greeks_valid(df: pd.DataFrame, max_vega_mismatch: float | None = 2.0,
+                 r: float = 0.01, q: float = 0.018) -> pd.Series:
+    """True where the vendor's implied vol and Greeks are usable.
+
+    The vendor files contain rows whose Greeks are plainly wrong: about 0.4% of 2016-2020 puts
+    carry a large negative vega (e.g. -1054 where the call at the same strike and expiry has 9.7),
+    and a cluster of 2019 rows has vega off by more than a factor of two.  Vega feeds the
+    Hull-White formula and every learned model, and a single value of -100,000 has enormous
+    leverage in a least-squares fit, so these rows are removed rather than repaired.
+
+    A row is valid when  iv > 0,  vega > 0,  gamma >= 0,  and (if ``max_vega_mismatch`` is set)
+    vendor vega is within that factor of Black-Scholes vega recomputed from the vendor's own iv.
+    The rate and dividend yield are approximate, which moves the recomputed vega by a few percent
+    at most; the default factor of 2 only catches gross errors.
+    """
+    from .bs import bs_vega
+    ok = (df["iv"] > 0) & (df["vega"] > 0) & (df["gamma"] >= 0) & (df["T"] > 0)
+    if max_vega_mismatch is not None:
+        iv = df["iv"].where(df["iv"] > 0, np.nan)
+        ratio = df["vega"] / bs_vega(df["S"], df["strike"], df["T"].where(df["T"] > 0, np.nan), r, iv, q)
+        ok &= ratio.between(1.0 / max_vega_mismatch, max_vega_mismatch)
+    return ok
+
+
+def corrupt_iv_days(long: pd.DataFrame, band: float = 0.03, min_rows: int = 10,
+                    max_ratio: float = 2.0, min_iv: float = 0.01) -> list[pd.Timestamp]:
+    """Quote dates on which the vendor's implied vols are broken for the whole surface.
+
+    Found in the files: on 2019-05-02, -03, -06, -07, -08 and -17 near-the-money calls show an
+    implied vol around 0.45 (0.15 on the days either side) and puts show about 0.0005.  Prices
+    are fine, but every Greek on those days, including the Black-Scholes delta the project uses
+    as its benchmark, is computed from the wrong vol, so the whole day has to go.
+
+    Test: among options within ``band`` of the money with at least 14 days to expiry, the median
+    call IV and the median put IV must both exceed ``min_iv`` and be within a factor
+    ``max_ratio`` of each other.  (On normal days the ratio is 1.1-1.3.)  Days with fewer than
+    ``min_rows`` such options on either side are not judged.
+    """
+    near = long[(long["moneyness"] - 1).abs().lt(band) & (long["dte"] >= 14) & (long["bid"] > 0)]
+    g = near.groupby(["date", "type"], observed=True)["iv"]
+    med = g.median().unstack("type")
+    cnt = g.size().unstack("type").reindex_like(med).fillna(0)
+    if not {"C", "P"} <= set(med.columns):
+        return []
+    judged = (cnt["C"] >= min_rows) & (cnt["P"] >= min_rows)
+    c, pt = med["C"].fillna(0.0), med["P"].fillna(0.0)
+    ratio = c / pt.where(pt > 0)
+    bad = judged & ((c < min_iv) | (pt < min_iv) | ~ratio.between(1 / max_ratio, max_ratio))
+    return list(med.index[bad])
+
+
 def apply_filters(df: pd.DataFrame, cfg: FilterConfig = FilterConfig()) -> pd.DataFrame:
     """Apply the sample filters.  Returns a copy."""
     m = (df["dte"] >= cfg.min_dte) & df["delta"].abs().between(cfg.min_abs_delta, cfg.max_abs_delta)
+    if cfg.require_valid_greeks:
+        m &= greeks_valid(df, cfg.max_vega_mismatch)
     if cfg.require_positive_bid:
         m &= df["bid"] > 0
     if cfg.require_volume:

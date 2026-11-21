@@ -1,6 +1,7 @@
 # raw and processed data are large; share via Drive, not git
 data/raw/**
 data/processed/**
+data/processed_*/
 !data/raw/*/
 !data/raw/*/.gitkeep
 !data/processed/.gitkeep

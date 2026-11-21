@@ -68,3 +68,39 @@ and nine training years; run `configs/traded_only_2016_2020.yaml` before compari
 Hull-White coefficients on the training years: calls (-0.08, -0.15, 0.14), puts (-0.12, -0.37, -0.27).
 Memory: load `pairs.parquet` with `columns=` (see `evaluate.EVAL_COLUMNS`) and cast to float32;
 the full 35-column table is ~3 GB in pandas.
+
+## Baselines prep (2026-11-20)
+
+Code changes before running notebook 02, and two vendor data defects found while testing them.
+
+- `src/store.py`: `load_pairs` (modelling columns only, float32: 0.54 GB instead of ~3 GB) and
+  `save_predictions` / `load_predictions` (one small file per model, joined by contract key and
+  date). Notebooks no longer pass full copies of the table to each other.
+- `config.sample_paths(SAMPLE)`: inputs and outputs per sample (`main`, `traded_only`), so results
+  from the two samples never overwrite each other. Tables go to `tables/<sample>/`.
+- `evaluate.py`: no copies of the big table; `standard_report` adds the Feb-Apr 2020 table;
+  `vega_attribution` and `in_sample_ceiling` put gain ratios in context.
+- `GBMResidual`: row subsampling now active (`subsample_freq`), seed passed, importance().
+  `HullWhite` fits in float64.
+
+**Vendor defect 1: impossible put vegas.** About 0.4% of puts have a large negative vega in the raw
+files (e.g. -1054.49 against 9.68 for the matching call). `load.greeks_valid` now drops rows with
+iv <= 0, vega <= 0, gamma < 0 or vega more than 2x away from Black-Scholes: 16,350 option-days.
+
+**Vendor defect 2: six days of corrupt implied vols.** 2019-05-02, -03, -06, -07, -08, -17: call IV
+~0.45, put IV ~0.0005, so every Greek is wrong. `load.corrupt_iv_days` drops them: 65,160 rows.
+
+Dataset is now 5,372,273 pairs (was 5,419,731). **Everyone must rebuild** from
+`configs/main_2016_2020.yaml` and check the count against `data/processed/pairs_h1_summary.csv`.
+
+Effect on the untuned baselines (gain ratio vs Black-Scholes, fitted on 2016-18). These replace
+the table above; a proper run with commentary belongs in notebook 02.
+
+| | HW calls | HW puts | GBM calls | GBM puts |
+|---|---|---|---|---|
+| val 2019 | 0.042 | 0.101 | 0.076 | 0.122 |
+| test 2020 | 0.191 | 0.161 | 0.156 | 0.067 |
+| Feb-Apr 2020 | 0.216 | 0.178 | 0.181 | 0.067 |
+
+Hull-White on puts went from 0.036 to 0.161 on 2020 once the bad vegas were removed.
+Hull-White coefficients: calls (-0.082, -0.139, 0.123), puts (-0.247, -0.264, 0.150).
