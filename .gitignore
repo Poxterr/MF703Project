@@ -28,3 +28,6 @@ __pycache__/
 # model checkpoints
 *.pt
 *.pth
+
+# simulated data is rebuilt by notebook 04
+data/simulated/

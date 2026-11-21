@@ -490,3 +490,38 @@ def test_costs_zero_cost_gain_matches_evaluate():
     assert g0 == pytest.approx(evaluate.gain_ratio(p, "m"))
     by = costs.net_gain(p, ["m"], bps=(0, 5), by=["type"])
     assert by.loc[(0, "C"), "m"] == pytest.approx(g0)
+
+
+# --------------------------------------------------------------------------- #
+# Heston simulation                                                           #
+# --------------------------------------------------------------------------- #
+def test_heston_price_reduces_to_black_scholes_without_vol_of_vol():
+    import dataclasses
+    from src import heston
+    p = dataclasses.replace(heston.HestonParams(), xi=1e-4, kappa=0.0, rho=0.0)
+    K = np.array([2700.0, 3000.0, 3300.0])
+    for T in (14 / 365, 0.5):                                     # short maturities are the hard case
+        got = heston.heston_call(3000.0, K, T, p, 0.04)
+        assert got == pytest.approx(bs_price(3000.0, K, T, p.r, 0.2, "C"), abs=1e-3)
+
+
+def test_heston_mv_delta_is_below_plain_delta_when_vol_falls_as_index_rises():
+    import dataclasses
+    from src import heston
+    p = heston.HestonParams(xi=0.3, rho=-0.7)
+    K, kinds = np.array([2900.0, 3000.0, 3100.0]), np.array(["C", "C", "P"])
+    mv = heston.mv_delta(3000.0, K, 0.25, kinds, 0.04, p)
+    plain = heston.mv_delta(3000.0, K, 0.25, kinds, 0.04, dataclasses.replace(p, rho=0.0))   # dC/dS only
+    assert (mv < plain).all()
+    assert mv[0] - mv[2] > 0                                       # a call delta is positive, a put delta negative
+
+
+def test_heston_simulated_pairs_carry_the_truth():
+    from src import heston
+    pairs = heston.simulate_pairs(heston.HestonParams(xi=0.3), n_days=60, seed=3, split="test",
+                                  moneyness_grid=np.linspace(0.92, 1.08, 5), maturities_days=(45,))
+    schema.assert_schema(pairs, schema.PAIRS_SCHEMA, "simulated pairs")
+    assert {"v_true", "delta_true", "true_corr"} <= set(pairs.columns) and (pairs["split"] == "test").all()
+    assert pairs["delta"].abs().between(0.05, 0.95).all() and (pairs["dte"] >= 14).all()
+    assert (pairs["true_corr"] < 0).all()                          # rho < 0: the correction lowers every delta
+    assert evaluate.gain_ratio(pairs, "true") > 0                  # and hedges better than Black-Scholes

@@ -159,3 +159,27 @@ starts a new episode), set-up and unwind both charged. Tables in `tables/main/co
   hedge ratio cancels over up-and-down days when summed but not when squared daily. NOT tested.
   Episodes overlap and share one index path, so this is weak evidence; report both horizons.
 - Left out: option bid-ask, financing, market impact, intraday rebalancing.
+
+## Heston known-model check run (2026-11-21)
+
+Notebook 04 executed. `src/heston.py`: pricer integration range now adapts to maturity and
+variance (the fixed range was off by up to 0.5 index points for 14-day options in a calm market),
+`mv_delta` gives the exact minimum-variance delta dC/dS + (rho xi / S) dC/dv by central
+differences, `simulate_pairs` returns a pairs table with the truth attached. Simulated table is
+cached in `data/simulated/` (git-ignored, about 6 minutes to rebuild). Tables in `tables/heston/`,
+figures in `figures/heston/`. Parameters: kappa 2, theta 0.04, xi 0.3, rho -0.7.
+
+Gain vs Black-Scholes (networks: 5-seed average), with the true MV delta as the ceiling:
+
+| test market | true | hw | gbm | nn_direct | nn_resid | nn_resid_hw |
+|---|---|---|---|---|---|---|
+| same parameters | 0.142 | 0.127 | 0.131 | 0.113 | 0.131 | 0.139 |
+| high vol (v0 = 0.25) | 0.078 | 0.058 | 0.064 | -0.750 | 0.085 | -0.024 |
+| low correlation (rho = -0.1) | 0.005 | -0.055 | -0.056 | -0.153 | -0.126 | -0.121 |
+
+- Same market: every model recovers 80-98% of the achievable gain. The check passes.
+- High vol, same law: the direct network collapses (as on real 2020); the residual network
+  matches the truth; nn_resid_hw fails because Heston's correction scales with vega/(S sigma),
+  not vega/(S sqrt T), and it has no vol input.
+- Low correlation: every fitted model loses, as Hull-White did in Q3 2020. Inputs look normal.
+- Limits: one parameter set, one path per test market, no theta input, lr 1e-3.
