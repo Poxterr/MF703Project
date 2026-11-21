@@ -386,6 +386,46 @@ def test_black_scholes_roundtrip():
     assert -1 < bs_delta(S, K, T, r, sig, "P") < 0
 
 
+def test_feature_matrix_derived_features_are_scale_free():
+    p = _synthetic_pairs(200)
+    X = models.feature_matrix(p, ["T", "log_m", "vega_s", "gamma_s", "theta_s"])
+    assert X.dtype == np.float32 and X.shape == (200, 5)
+    assert np.allclose(X[:, 2], p["vega"] / p["S"], rtol=1e-5)
+    # doubling the index level with moneyness fixed: vega and theta double, gamma halves -> same inputs
+    q = p.assign(S=p["S"] * 2, vega=p["vega"] * 2, theta=p["theta"] * 2, gamma=p["gamma"] / 2)
+    assert np.allclose(models.feature_matrix(q, ["vega_s", "gamma_s", "theta_s"]), X[:, 2:], rtol=1e-5)
+    with pytest.raises(KeyError, match="neither a column"):
+        models.feature_matrix(p, ["no_such_feature"])
+
+
+def test_neural_hedger_options():
+    pytest.importorskip("torch")
+    p = _synthetic_pairs(3000)
+    kw = dict(hidden=(8,), max_epochs=3, patience=3, features=["T", "delta"])
+    plain = models.NeuralHedger(residual=True, **kw).fit(p, val=p)
+    # chunked scoring gives the same predictions as one pass
+    chunked = models.NeuralHedger(residual=True, eval_batch=97, **kw).fit(p, val=p)
+    assert np.allclose(plain.predict(p), chunked.predict(p), atol=1e-5)
+    # Hull-White scaling: the correction is the network output times vega / (S sqrt(T))
+    hw = models.NeuralHedger(residual=True, output_scale="hw", label="nn_hw", **kw).fit(p, val=p)
+    assert hw.name == "nn_hw"
+    corr = hw.predict(p) - p["delta"].to_numpy()
+    q = p.assign(vega=p["vega"] * 3)                       # 3x the vega -> 3x the correction, same inputs
+    assert np.allclose(hw.predict(q) - q["delta"].to_numpy(), 3 * corr, rtol=1e-4, atol=1e-6)
+    # clipping: inputs far outside the training range are treated as the edge of it
+    clip = models.NeuralHedger(residual=True, clip_inputs=2.0, **kw).fit(p, val=p)
+    far = p.head(5).assign(T=1e6); edge = p.head(5).assign(T=p["T"].mean() + 2.0 * p["T"].std(ddof=0))
+    assert np.allclose(clip.predict(far), clip.predict(edge), atol=1e-4)
+    # same seed -> same model; different seed -> different model
+    again = models.NeuralHedger(residual=True, **kw).fit(p, val=p)
+    other = models.NeuralHedger(residual=True, seed=1, **kw).fit(p, val=p)
+    assert np.allclose(plain.predict(p), again.predict(p)) and not np.allclose(plain.predict(p), other.predict(p))
+    with pytest.raises(ValueError):
+        models.NeuralHedger(residual=False, output_scale="hw")
+    with pytest.raises(ValueError):
+        models.NeuralHedger(output_scale="nope")
+
+
 def test_neural_hedger_runs():
     pytest.importorskip("torch")
     rng = np.random.default_rng(1)
