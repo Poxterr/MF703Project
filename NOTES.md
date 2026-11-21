@@ -183,3 +183,11 @@ Gain vs Black-Scholes (networks: 5-seed average), with the true MV delta as the 
   not vega/(S sqrt T), and it has no vol input.
 - Low correlation: every fitted model loses, as Hull-White did in Q3 2020. Inputs look normal.
 - Limits: one parameter set, one path per test market, no theta input, lr 1e-3.
+
+## Notebook 01 re-run (2026-11-21)
+
+Re-run on the cleaned table (5,372,273 pairs); duplicated cell removed and the commentary
+updated. New vendor defect found while checking a one-day dip: from 2019-04-04 to 2019-04-16 the
+vendor's expiry dates are one day early for most expiries (some land on a Sunday). 2019-04-03
+therefore has 1,573 pairs instead of about 5,000, and T is one day short on those nine days.
+Documented in `docs/data_pipeline.md`; not corrected (0.4% of 2019 pairs carry a weekend expiry).
