@@ -13,3 +13,5 @@ filters:
   require_positive_bid: true
   require_volume: false
   drop_crossed: true
+  require_valid_greeks: true   # drop rows with impossible vendor Greeks (load.greeks_valid)
+  max_vega_mismatch: 2.0

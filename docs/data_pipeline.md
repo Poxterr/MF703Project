@@ -23,7 +23,7 @@ Drive folder and placed under `data/raw/<year>/`.
 data/raw/<year>/spx_eod_YYYYMM.txt
         │  stage 1  (src/load.py + src/build_dataset.clean_file)
         │   parse vendor text ─► one row per option (call / put) ─► exchange-calendar check
-        │   ─► hard input checks ─► sample filters ─► schema assertion ─► Parquet + quality report
+        │   ─► hard input checks ─► corrupt-IV days ─► sample + Greek-validity filters ─► schema assertion ─► Parquet + quality report
         ▼
 data/processed/spx_eod_YYYYMM.parquet     load_report.csv     data_quality.md
         │  stage 2  (src/build_dataset.build_pairs_year)
@@ -59,11 +59,20 @@ as `build_config.yaml`, so every `pairs.parquet` records how it was made. Proces
    the file name, a month with no trading days left, implied vol not in decimal, and Greeks that
    disagree with Black–Scholes recomputed from the vendor's own implied vol (catches the vega
    units problem, a swapped delta column, or IV in percent).
-6. **Sample filters**, following Hull and White (2017) and Qiao and Wan (2024): at least 14
+6. **Corrupt-IV days.** A day is removed whole when the vendor's implied vols are broken across
+   the surface: among near-the-money options the median call IV and median put IV must both
+   exceed 0.01 and lie within a factor of two of each other (`load.corrupt_iv_days`). Prices on
+   such days are fine, but every Greek, including the Black–Scholes delta used as the benchmark,
+   is computed from the wrong vol.
+7. **Sample filters**, following Hull and White (2017) and Qiao and Wan (2024): at least 14
    calendar days to expiry, $0.05 \le |\delta| \le 0.95$, bid $> 0$, bid $\le$ ask. The traded-only
    variant (`require_volume: true`) additionally requires volume $> 0$ on the quote day.
-7. **Schema assertion** against `OPTION_DAY_SCHEMA`, then one Parquet per raw file and one row in
-   `load_report.csv` (counts, missing days, zero-bid days, units-check results).
+8. **Greek validity** (`load.greeks_valid`): rows with impossible vendor Greeks are dropped:
+   implied vol or vega not positive, negative gamma, or vega more than a factor of two away from
+   Black–Scholes vega recomputed from the vendor's own implied vol.
+9. **Schema assertion** against `OPTION_DAY_SCHEMA`, then one Parquet per raw file and one row in
+   `load_report.csv` (counts, missing days, zero-bid days, corrupt-IV days, invalid-Greek rows,
+   units-check results).
 
 ### Stage 2: pair
 
@@ -92,16 +101,16 @@ any scale (the 2010–2023 run is 13 million rows).
 ## The 2016–2020 dataset
 
 Built with `configs/main_2016_2020.yaml` (all quoted options, one-day horizon, train 2016–18,
-validate 2019, test 2020). 60 files, 82 seconds on a laptop-class machine.
+validate 2019, test 2020). 60 files, about 90 seconds on a laptop-class machine.
 
-| Year | Trading days in data | Raw strike rows | Option-days after filters | Pairs | Calls / puts | Start days lost to gaps | $\mathbb{E}[\varepsilon_{BS}^2]$ calls | puts | mean $|\Delta S|$ |
+| Year | Trading days used | Raw strike rows | Option-days after filters | Pairs | Calls / puts | Start days lost to gaps | $\mathbb{E}[\varepsilon_{BS}^2]$ calls | puts | mean $|\Delta S|$ |
 |---|---|---|---|---|---|---|---|---|---|
-| 2016 | 251 | 940,596 | 661,539 | 610,126 | 290,087 / 320,039 | 1 | 2.55 | 2.17 | 12.0 |
-| 2017 | 250 | 1,023,605 | 736,105 | 667,606 | 352,248 / 315,358 | 1 | 1.79 | 1.31 | 7.2 |
-| 2018 | 251 | 1,382,559 | 1,328,518 | 1,224,338 | 714,586 / 509,752 | 0 | 10.24 | 10.30 | 20.4 |
-| 2019 | 247 | 1,452,262 | 1,367,654 | 1,236,295 | 719,069 / 517,226 | 5 | 4.58 | 5.93 | 16.2 |
-| 2020 | 250 | 1,736,777 | 1,845,164 | 1,681,366 | 864,630 / 816,736 | 4 | 82.28 | 78.66 | 42.7 |
-| **Total** | 1,249 | 6,535,799 | 5,938,980 | **5,419,731** | 2,940,620 / 2,479,111 | 11 | | | |
+| 2016 | 251 | 940,596 | 660,966 | 609,733 | 289,920 / 319,813 | 1 | 2.55 | 2.17 | 12.0 |
+| 2017 | 250 | 1,023,605 | 734,828 | 666,821 | 351,696 / 315,125 | 1 | 1.79 | 1.31 | 7.2 |
+| 2018 | 251 | 1,382,559 | 1,323,557 | 1,219,623 | 710,351 / 509,272 | 0 | 10.26 | 10.28 | 20.4 |
+| 2019 | 241 | 1,452,262 | 1,331,772 | 1,197,815 | 694,009 / 503,806 | 7 | 4.49 | 4.21 | 16.2 |
+| 2020 | 250 | 1,736,777 | 1,840,335 | 1,678,281 | 862,719 / 815,562 | 4 | 82.37 | 78.64 | 42.7 |
+| **Total** | 1,243 | 6,535,799 | 5,891,458 | **5,372,273** | 2,908,695 / 2,463,578 | 13 | | | |
 
 Benchmark errors are in index points per option. For comparison, Qiao and Wan (2024) had about
 2.07 million quotes after the same filters over 2010–2019; the OptionsDX files include weeklies and
@@ -116,6 +125,15 @@ a denser strike grid, so our five years give more than twice their ten.
   one start day of pairs (the day before it); nothing is bridged.
 - **One non-trading day with rows:** 2018-12-05 (the market closed for President Bush's funeral;
   the vendor still produced 12,036 rows). Dropped.
+- **Six days with corrupt implied vols:** 2019-05-02, -03, -06, -07, -08 and -17. Near-the-money
+  calls show an implied vol around 0.45 (0.15 on neighbouring days) and puts about 0.0005, so all
+  Greeks on those days are wrong. 65,160 option rows; the days are removed and behave like
+  missing days.
+- **Rows with impossible Greeks:** 16,350 option-days that pass every other filter, mostly puts
+  with a large negative vega (the raw file has `P_VEGA = -1054.49` where the call at the same
+  strike and expiry has 9.68). Although only 0.3% of rows, they mattered: with them in the sample
+  the Hull–White regression for puts was badly distorted (gain ratio on 2020 puts 0.04 with them,
+  0.16 without), and the 2019 put benchmark error was overstated by 40%.
 - **Zero bids** on 6–9% of raw option rows per year, almost all deep out-of-the-money; removed by
   the bid $> 0$ filter.
 - **Units check:** vendor delta agrees with Black–Scholes delta from the vendor's IV to a median
@@ -124,7 +142,7 @@ a denser strike grid, so our five years give more than twice their ten.
   market-maker quotes are tight, median spread 2.3% of mid); `traded_only_2016_2020.yaml` builds the
   paper-style subsample for a robustness check. With all quotes kept, calls pile up in the 0.9
   delta bucket (deep in-the-money, quoted but never traded); the traded-only sample does not.
-- **2020 dominates any pooled statistic.** Its benchmark error is 16–35 times the other years'
+- **2020 dominates any pooled statistic.** Its benchmark error is 8–46 times the other years'
   and the mean daily index move is 2–6 times larger. Results must be reported by year and by the
   February–April 2020 window separately, which is what the proposal's crisis extension does.
 
@@ -136,9 +154,9 @@ pip install -r requirements.txt
 python -m src.build_dataset --config configs/main_2016_2020.yaml     # the project dataset
 python -m src.build_dataset --config configs/traded_only_2016_2020.yaml
 python -m src.build_dataset --years 2021 --out data/processed          # add a year to an existing build
-pytest tests/                                                          # 12 tests, a few seconds
+pytest tests/                                                          # 20 tests, a few seconds
 ```
 
 Tests run on synthetic vendor files and cover parsing, filters, the units and schema checks, the
-calendar logic (a missing day drops a pair; a holiday row is removed), the pairing arithmetic, and
-one end-to-end build from a config file. GitHub Actions runs them on every pull request.
+calendar logic (a missing day drops a pair; a holiday row is removed), corrupt-IV days and
+invalid-Greek rows, the pairing arithmetic, and one end-to-end build from a config file. GitHub Actions runs them on every pull request.

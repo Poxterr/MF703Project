@@ -15,7 +15,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src import load, build_dataset as B, models, evaluate, checks, schema  # noqa: E402
+from src import load, build_dataset as B, models, evaluate, checks, schema, store  # noqa: E402
 from src.bs import bs_delta, bs_price, bs_vega, implied_vol  # noqa: E402
 
 HEADER = ("[QUOTE_UNIXTIME], [QUOTE_READTIME], [QUOTE_DATE], [QUOTE_TIME_HOURS], [UNDERLYING_LAST], "
@@ -175,6 +175,43 @@ def test_holiday_rows_are_dropped(raw_dir, cal):
     assert list(nxt) == [pd.Timestamp("2016-01-19")]
 
 
+def test_invalid_greeks_rows_are_dropped(raw_dir):
+    """A put with the vendor's negative-vega glitch must not reach the modelling table."""
+    p = raw_dir / "2016" / "spx_eod_201601.txt"
+    long = load.to_long(load.read_raw(p))
+    clean = load.apply_filters(long)
+    victim = long[(long["type"] == "P") & (long["strike"] == 2000) & (long["date"] == "2016-01-05")].index
+    long.loc[victim, "vega"] = -105449.0                      # as found in spx_eod_201806.txt
+    assert not load.greeks_valid(long).loc[victim].any()
+    assert len(load.apply_filters(long)) == len(clean) - 1
+    off = load.FilterConfig(require_valid_greeks=False)
+    assert len(load.apply_filters(long, off)) == len(clean)   # the switch works
+
+
+def test_corrupt_iv_day_is_dropped_and_reported(raw_dir, cal):
+    """A day whose put IVs are ~0 (as on 2019-05-02) is removed whole and listed in the report."""
+    strikes = tuple(range(1950, 2100, 5))                      # enough near-the-money rows to judge the day
+    lines = [HEADER]
+    for d in JAN:
+        dte = (pd.Timestamp("2016-03-18") - pd.Timestamp(d)).days
+        for K in strikes:
+            row = _row(d, S_JAN[d], "2016-03-18", dte, K)
+            if d == "2016-01-12":                              # break the put IV on this one day
+                f = row.split(", "); f[29] = "0.00050"; row = ", ".join(f)
+            lines.append(row)
+    p = raw_dir / "2016" / "spx_eod_201601.txt"
+    p.write_text("\n".join(lines) + "\n")
+    long = load.to_long(load.read_raw(p))
+    assert load.corrupt_iv_days(long) == [pd.Timestamp("2016-01-12")]
+    cfg = B.BuildConfig(raw_dir=raw_dir, out_dir=raw_dir.parent / "out")
+    df, rep = B.clean_file(p, cfg, cal)
+    assert pd.Timestamp("2016-01-12") not in set(df["date"])
+    assert rep["corrupt_iv_dates"] == "2016-01-12" and rep["corrupt_iv_rows_dropped"] == len(strikes) * 2
+    assert "2016-01-12" not in str(rep["missing_trading_days"])
+    pairs = B.pair_frame(df, cal)
+    assert "2016-01-11" not in set(pairs["date"].dt.strftime("%Y-%m-%d"))   # no forward leg, nothing bridged
+
+
 # --------------------------------------------------------------------------- #
 # End to end                                                                  #
 # --------------------------------------------------------------------------- #
@@ -228,6 +265,117 @@ def test_hull_white_and_gain_ratio():
     p["delta_hw"] = hw.predict(p)
     assert 0.9 < evaluate.gain_ratio(p, "hw") <= 1.0
     assert np.isclose(evaluate.gain_ratio(p, "bs"), 0.0)
+
+
+def _synthetic_pairs(n=6000, seed=0):
+    """A pairs-like frame where the true hedge ratio is delta - 0.05 for calls and delta - 0.02 for
+    puts, and the option price also moves with an independent IV shock."""
+    rng = np.random.default_rng(seed)
+    kind = np.where(rng.random(n) < 0.5, "C", "P")
+    mag = rng.uniform(0.1, 0.9, n)
+    delta = np.where(kind == "C", mag, -mag)
+    dates = pd.to_datetime("2018-01-02") + pd.to_timedelta(rng.integers(0, 1080, n), unit="D")
+    p = pd.DataFrame({
+        "type": pd.Categorical(kind), "expiry": pd.Timestamp("2022-01-21"),
+        "strike": rng.permutation(n).astype("float64"), "date": dates,
+        "T": rng.uniform(0.05, 1, n), "delta": delta, "moneyness": rng.uniform(0.9, 1.1, n),
+        "iv": rng.uniform(0.1, 0.3, n), "theta": -rng.uniform(0, 1, n),
+        "vega": rng.uniform(100, 400, n), "gamma": rng.uniform(0, 0.01, n), "S": 3000.0,
+        "dte": rng.uniform(14, 400, n),
+    })
+    p["year"] = p["date"].dt.year
+    p["split"] = np.select([p.year == 2018, p.year == 2019], ["train", "val"], "test")
+    p["dS"] = rng.normal(0, 20, n)
+    p["d_iv"] = rng.normal(0, 0.004, n)
+    shift = np.where(kind == "C", -0.05, -0.02)
+    p["dV"] = (p["delta"] + shift) * p["dS"] + p["vega"] * p["d_iv"] + rng.normal(0, 0.2, n)
+    p["y"], p["w"] = p["dV"] / p["dS"], p["dS"] ** 2
+    p["delta_bucket"] = B.delta_bucket(p["delta"]); p["ttm_class"] = B.ttm_class(p["dte"])
+    return p
+
+
+def test_gbm_residual_learns_the_shift():
+    pytest.importorskip("lightgbm")
+    p = _synthetic_pairs()
+    tr, va, te = (p[p.split == s] for s in ("train", "val", "test"))
+    gbm = models.GBMResidual(params=dict(n_estimators=200, learning_rate=0.1, num_leaves=7,
+                                         min_child_samples=50, subsample=0.8, subsample_freq=1,
+                                         verbose=-1)).fit(tr, val=va)
+    te = evaluate.add_predictions(te, {"gbm": gbm})
+    assert evaluate.gain_ratio(te, "gbm") > 0.0                 # beats Black-Scholes out of sample
+    corr = (te["delta_gbm"] - te["delta"]).groupby(te["type"], observed=True).mean()
+    assert abs(corr["C"] + 0.05) < 0.02 and abs(corr["P"] + 0.02) < 0.02
+    assert "is_call" in gbm.importance().index
+    # same seed -> same model
+    again = models.GBMResidual(params=gbm.params).fit(tr, val=va)
+    assert np.allclose(again.predict(te), gbm.predict(te))
+
+
+def test_standard_report_tables_and_no_mutation(tmp_path):
+    p = _synthetic_pairs()
+    p["delta_m"] = p["delta"] + np.where(p["type"] == "C", -0.05, -0.02)     # the true hedge
+    cols_before = list(p.columns)
+    tables = evaluate.standard_report(p, ["m"], tmp_path / "t")
+    assert list(p.columns) == cols_before                                    # nothing added to the big table
+    assert set(tables) == {"by_split_type", "by_year_type", "by_delta_bucket", "by_maturity", "crisis"}
+    assert tables["crisis"]["n"].sum() == evaluate.crisis_mask(p).sum()
+    assert (tables["by_split_type"]["m"] > 0).all()
+    assert tables["by_split_type"]["n"].sum() == len(p)
+    assert tables["by_delta_bucket"]["n"].sum() == (p.split == "test").sum()   # test split only
+    assert (tmp_path / "t" / "gain_by_year_type.csv").exists()
+    # the grouped numbers agree with the direct formula
+    sub = p[(p.split == "test") & (p.type == "C")]
+    assert np.isclose(tables["by_split_type"].loc[("test", "C"), "m"], evaluate.gain_ratio(sub, "m"))
+    # no crisis table when the window is empty
+    q = p.copy(); q["date"] = pd.Timestamp("2019-06-03")
+    assert "crisis" not in evaluate.standard_report(q, ["m"])
+
+
+def test_vega_attribution_and_ceiling():
+    p = _synthetic_pairs()
+    va = evaluate.vega_attribution(p, ["type"])
+    assert (va["vega_share"] > 0.5).all() and (va["vega_share"] < 1).all()   # IV shocks are most of the error
+    # if dV has no IV component, attributing one only adds error: the share goes negative
+    q = p.assign(dV=p["dV"] - p["vega"] * p["d_iv"])
+    assert evaluate.vega_attribution(q)["vega_share"].iloc[0] < 0
+    ceil = evaluate.in_sample_ceiling(p, models.HullWhite, "hw")
+    assert list(ceil.columns) == ["hw_ceiling"] and len(ceil) == p["year"].nunique() * 2
+    hw = models.HullWhite().fit(p[p.year == 2018])
+    oos = evaluate.gain_ratio(evaluate.add_predictions(p[(p.year == 2020) & (p.type == "C")], {"hw": hw}), "hw")
+    assert ceil.loc[(2020, "C"), "hw_ceiling"] >= oos - 1e-9                 # in-sample fit is an upper bound
+
+
+def test_predictions_roundtrip_and_mismatch(tmp_path):
+    p = _synthetic_pairs(500)
+    p["delta_hw"] = (p["delta"] - 0.03).astype("float32")
+    store.save_predictions(p, ["hw"], tmp_path / "pred")
+    back = store.load_predictions(p.drop(columns="delta_hw").sample(frac=1, random_state=1), ["hw"], tmp_path / "pred")
+    merged = back.set_index(store.ROW_KEY)["delta_hw"].sort_index()
+    assert np.allclose(merged, p.set_index(store.ROW_KEY)["delta_hw"].sort_index())
+    with pytest.raises(FileNotFoundError, match="run the notebook"):
+        store.load_predictions(p, ["nn_resid"], tmp_path / "pred")
+    other = _synthetic_pairs(500, seed=9)                                    # a different build
+    with pytest.raises(ValueError, match="different build"):
+        store.load_predictions(other, ["hw"], tmp_path / "pred")
+
+
+def test_load_pairs_is_lean(tmp_path):
+    p = _synthetic_pairs(300)
+    p["extra_wide_column"] = 1.0
+    p.to_parquet(tmp_path / "pairs.parquet", index=False)
+    cols = [c for c in store.MODEL_COLUMNS if c in p.columns]
+    df = store.load_pairs(tmp_path / "pairs.parquet", columns=cols, years=[2020])
+    assert "extra_wide_column" not in df and set(df["year"]) == {2020}
+    assert df["dS"].dtype == "float32" and df["date"].dtype.kind == "M"
+
+
+def test_sample_paths_are_separate():
+    import config
+    a, b = config.sample_paths("main"), config.sample_paths("traded_only")
+    assert a["pairs"] != b["pairs"] and a["tables"] != b["tables"] and a["predictions"] != b["predictions"]
+    assert a["config"].exists() and b["config"].exists()
+    with pytest.raises(KeyError):
+        config.sample_paths("nope")
 
 
 def test_black_scholes_roundtrip():
