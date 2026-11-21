@@ -24,7 +24,9 @@ filters:
   require_volume: false
   drop_crossed: true
   max_rel_spread: null
+  require_valid_greeks: true
+  max_vega_mismatch: 2.0
 min_abs_ds: 0.0
 vix_csv: null
 source_config: configs/main_2016_2020.yaml
-built: 2026-11-01 14:33
+built: 2026-11-20 19:04

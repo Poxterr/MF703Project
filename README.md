@@ -76,7 +76,9 @@ Then open the notebooks in order:
 - Pairing uses the NYSE calendar (`pandas_market_calendars`): a day missing from the vendor files drops a pair, never bridges one.
 - Splits are chronological and set in the config (default `proposal`: train 2016–18, val 2019, test 2020; also `paper` and `modern` in `build_dataset.SPLIT_SETS`). Never random-split: the same contract appears on consecutive days.
 - Every model exposes `fit(pairs)` / `predict(pairs)` and writes a `delta_<name>` column; `evaluate.gain_ratio` reads those columns.
-- Figures go to `figures/`, tables to `tables/`, with stable filenames so the report can reference them.
+- Load the table with `store.load_pairs` (modelling columns, float32). Each notebook saves its models' hedge ratios with `store.save_predictions`; later notebooks join them with `store.load_predictions`. No notebook writes a copy of the pairs table.
+- A notebook sets `SAMPLE = "main"` or `"traded_only"` and takes all paths from `config.sample_paths(SAMPLE)`.
+- Figures go to `figures/<sample>/`, tables to `tables/<sample>/`, with stable filenames so the report can reference them.
 
 ## Tests
 
@@ -84,7 +86,7 @@ Then open the notebooks in order:
 pytest tests/
 ```
 
-Twelve tests on synthetic vendor files: parsing, filters, the units and schema checks, calendar handling (gaps drop pairs, holiday rows are removed), pairing arithmetic, an end-to-end build from a config, Hull-White recovery and the gain ratio. GitHub Actions runs them on every pull request.
+Twenty tests on synthetic data: parsing, filters, the units and schema checks, calendar handling (gaps drop pairs, holiday rows are removed), corrupt-IV days and invalid Greeks, pairing arithmetic, an end-to-end build from a config, Hull-White and LightGBM recovery, the evaluation tables, and the predictions store. GitHub Actions runs them on every pull request.
 
 ## References
 
