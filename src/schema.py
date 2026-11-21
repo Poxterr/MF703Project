@@ -16,6 +16,7 @@ place.
 """
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 
 # --------------------------------------------------------------------------- #
@@ -24,6 +25,20 @@ import pandas as pd
 KEY = ["type", "expiry", "strike"]                     # identifies one contract
 FEATURES = ["T", "delta", "moneyness", "iv", "theta", "vega", "gamma"]   # Qiao & Wan (2024), Table 2
 SENTIMENT = ["index_ret", "vix"]                       # Chen & Li (2023) extras
+
+# Scale-free versions of the same information.  Vega, gamma and theta are quoted in index points,
+# so their level drifts with the index (vega and theta grow with S, gamma shrinks).  Black-Scholes
+# prices are homogeneous of degree one in (S, K), which makes vega/S, gamma*S and theta/S functions
+# of moneyness, maturity and vol only.  Models fed these see the same inputs whether the index is
+# at 2,000 or 3,500.  Computed on the fly by models.feature_matrix; not stored in the pairs table.
+DERIVED = {
+    "log_m": lambda p: np.log(p["moneyness"].to_numpy(dtype="float64")),
+    "vega_s": lambda p: p["vega"].to_numpy(dtype="float64") / p["S"].to_numpy(dtype="float64"),
+    "gamma_s": lambda p: p["gamma"].to_numpy(dtype="float64") * p["S"].to_numpy(dtype="float64"),
+    "theta_s": lambda p: p["theta"].to_numpy(dtype="float64") / p["S"].to_numpy(dtype="float64"),
+}
+FEATURES_SCALE_FREE = ["T", "delta", "log_m", "iv", "theta_s", "vega_s", "gamma_s"]
+FEATURES_MINIMAL = ["T", "delta", "iv"]              # under Black-Scholes the other Greeks follow from these
 
 # --------------------------------------------------------------------------- #
 # Stage 1: option-day table                                                   #
