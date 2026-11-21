@@ -27,7 +27,26 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
-from .schema import FEATURES
+from .schema import DERIVED, FEATURES
+
+
+def feature_matrix(pairs: pd.DataFrame, names: list[str]) -> np.ndarray:
+    """float32 matrix of the named features; names in ``schema.DERIVED`` are computed on the fly."""
+    cols = []
+    for n in names:
+        if n in pairs.columns:
+            cols.append(pairs[n].to_numpy(dtype="float32"))
+        elif n in DERIVED:
+            cols.append(DERIVED[n](pairs).astype("float32"))
+        else:
+            raise KeyError(f"feature {n!r} is neither a column of the table nor in schema.DERIVED")
+    return np.column_stack(cols)
+
+
+def hw_scale(pairs: pd.DataFrame) -> np.ndarray:
+    """vega / (S sqrt(T)): the factor Hull & White (2017) put in front of their correction."""
+    f = lambda c: pairs[c].to_numpy(dtype="float64")
+    return (f("vega") / (f("S") * np.sqrt(f("T")))).astype("float32")
 
 
 class HedgeModel:
@@ -105,7 +124,7 @@ class GBMResidual(HedgeModel):
         subsample=0.8, subsample_freq=1, colsample_bytree=0.8, verbose=-1))
 
     def _X(self, p: pd.DataFrame) -> pd.DataFrame:
-        X = p[self.features].copy()
+        X = pd.DataFrame(feature_matrix(p, self.features), columns=self.features, index=p.index)
         X["is_call"] = (p["type"] == "C").astype("float32")
         return X
 
@@ -145,6 +164,18 @@ class NeuralHedger(HedgeModel):
     Architecture follows the paper: hidden layers of 128 units, sigmoid activations,
     Adam at lr 1e-4, batch 1024, early stopping on the validation loss.
     Inputs are standardised with training-set mean and std.
+
+    Two options that matter out of sample (see notebook 03):
+
+    output_scale="hw"  the network output g(x) is multiplied by vega / (S sqrt(T)), so
+                       delta = delta_BS + g(x) * vega / (S sqrt(T)).  Hull-White is the special case
+                       g = a + b*delta + c*delta^2; the network generalises the bracket.  The
+                       correction then scales with vega automatically, as theory says it should.
+    clip_inputs=k      standardised inputs are clipped to [-k, k], so a year whose inputs lie far
+                       outside the training range is treated as the edge of that range rather than
+                       extrapolated.
+    features           names of table columns or of ``schema.DERIVED`` (scale-free) features.
+    label              overrides the default name ("nn_resid" / "nn_direct") in tables.
     """
     residual: bool = True
     features: list[str] = field(default_factory=lambda: FEATURES)
@@ -155,15 +186,42 @@ class NeuralHedger(HedgeModel):
     patience: int = 10
     seed: int = 0
     device: str = "cpu"
+    verbose: bool = False            # print train / validation loss after every epoch
+    eval_batch: int = 200_000        # rows per forward pass when scoring; keeps memory flat on millions of rows
+    output_scale: str = "none"       # "none" or "hw" (residual models only)
+    clip_inputs: float | None = None
+    label: str | None = None
 
     @property
     def name(self) -> str:
-        return "nn_resid" if self.residual else "nn_direct"
+        return self.label or ("nn_resid" if self.residual else "nn_direct")
+
+    def __post_init__(self):
+        if self.output_scale not in ("none", "hw"):
+            raise ValueError("output_scale must be 'none' or 'hw'")
+        if self.output_scale == "hw" and not self.residual:
+            raise ValueError("output_scale='hw' only applies to residual models")
 
     # -- helpers ---------------------------------------------------------------
     def _X(self, p: pd.DataFrame) -> np.ndarray:
-        X = p[self.features].to_numpy(dtype=np.float32)
-        return (X - self.mu_) / self.sd_
+        X = (feature_matrix(p, self.features) - self.mu_) / self.sd_
+        if self.clip_inputs is not None:
+            X = np.clip(X, -self.clip_inputs, self.clip_inputs)
+        return X.astype(np.float32)
+
+    def _scale(self, p: pd.DataFrame) -> np.ndarray:
+        """Multiplier applied to the raw network output (1 unless output_scale='hw')."""
+        return hw_scale(p) if self.output_scale == "hw" else np.ones(len(p), dtype=np.float32)
+
+    def _forward(self, X):
+        """Network output for a tensor of standardised inputs, computed in chunks without gradients."""
+        import torch
+        self.net_.eval()
+        out = []
+        with torch.no_grad():
+            for i in range(0, len(X), self.eval_batch):
+                out.append(self.net_(X[i:i + self.eval_batch]).squeeze(1))
+        return torch.cat(out) if out else torch.empty(0)
 
     def _build(self, n_in: int):
         import torch.nn as nn
@@ -178,28 +236,37 @@ class NeuralHedger(HedgeModel):
     def fit(self, pairs, val: pd.DataFrame | None = None):
         import torch
         torch.manual_seed(self.seed)
-        X_raw = pairs[self.features].to_numpy(dtype=np.float32)
-        self.mu_, self.sd_ = X_raw.mean(0), X_raw.std(0) + 1e-8
+        X_raw = feature_matrix(pairs, self.features).astype(np.float64)
+        self.mu_ = X_raw.mean(0).astype(np.float32)
+        self.sd_ = (X_raw.std(0) + 1e-8).astype(np.float32)
+        del X_raw
 
         def tensors(p):
             X = torch.tensor(self._X(p))
             dV = torch.tensor(p["dV"].to_numpy(dtype=np.float32))
+            # the output multiplier is folded into dS: (dV - (dbs + g*k) dS) = dV - dbs*dS - g*(k*dS)
             dS = torch.tensor(p["dS"].to_numpy(dtype=np.float32))
+            k = torch.tensor(self._scale(p))
             dbs = torch.tensor(p["delta"].to_numpy(dtype=np.float32))
-            return X, dV, dS, dbs
+            return X, dV, dS, dbs, k
 
-        Xtr, dVtr, dStr, dbtr = tensors(pairs)
+        Xtr, dVtr, dStr, dbtr, ktr = tensors(pairs)
         self.net_ = self._build(Xtr.shape[1]).to(self.device)
         opt = torch.optim.Adam(self.net_.parameters(), lr=self.lr)
 
-        def loss_fn(X, dV, dS, dbs):
-            f = self.net_(X).squeeze(1)
+        def loss_fn(X, dV, dS, dbs, k):
+            f = self.net_(X).squeeze(1) * k
             delta = dbs + f if self.residual else f
             return ((dV - delta * dS) ** 2).mean()
 
+        def full_loss(X, dV, dS, dbs, k):            # same loss over a whole set, chunked, no gradients
+            f = self._forward(X) * k
+            delta = dbs + f if self.residual else f
+            return ((dV - delta * dS) ** 2).mean().item()
+
         has_val = val is not None and len(val) > 0
         if has_val:
-            Xv, dVv, dSv, dbv = tensors(val)
+            Xv, dVv, dSv, dbv, kv = tensors(val)
         best, best_state, bad = np.inf, None, 0
         n = len(Xtr)
         self.history_ = []
@@ -209,15 +276,15 @@ class NeuralHedger(HedgeModel):
             for i in range(0, n, self.batch_size):
                 idx = perm[i:i + self.batch_size]
                 opt.zero_grad()
-                loss = loss_fn(Xtr[idx], dVtr[idx], dStr[idx], dbtr[idx])
+                loss = loss_fn(Xtr[idx], dVtr[idx], dStr[idx], dbtr[idx], ktr[idx])
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.net_.parameters(), 1.0)
                 opt.step()
-            self.net_.eval()
-            with torch.no_grad():
-                tr = loss_fn(Xtr, dVtr, dStr, dbtr).item()
-                vl = loss_fn(Xv, dVv, dSv, dbv).item() if has_val else tr
+            tr = full_loss(Xtr, dVtr, dStr, dbtr, ktr)
+            vl = full_loss(Xv, dVv, dSv, dbv, kv) if has_val else tr
             self.history_.append((epoch, tr, vl))
+            if self.verbose:
+                print(f"{self.name} epoch {epoch:3d}  train {tr:.4f}  val {vl:.4f}", flush=True)
             if vl < best - 1e-9:
                 best, bad = vl, 0
                 best_state = {k: v.clone() for k, v in self.net_.state_dict().items()}
@@ -231,9 +298,7 @@ class NeuralHedger(HedgeModel):
 
     def predict(self, pairs):
         import torch
-        self.net_.eval()
-        with torch.no_grad():
-            f = self.net_(torch.tensor(self._X(pairs))).squeeze(1).numpy()
+        f = self._forward(torch.tensor(self._X(pairs))).numpy() * self._scale(pairs)
         return pairs["delta"].to_numpy() + f if self.residual else f
 
     def correction_surface(self, moneyness, T, template_row: pd.Series) -> np.ndarray:
