@@ -29,4 +29,4 @@ filters:
 min_abs_ds: 0.0
 vix_csv: null
 source_config: configs/main_2016_2020.yaml
-built: 2026-11-20 19:04
+built: 2026-11-21 18:31

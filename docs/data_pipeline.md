@@ -129,6 +129,11 @@ a denser strike grid, so our five years give more than twice their ten.
   calls show an implied vol around 0.45 (0.15 on neighbouring days) and puts about 0.0005, so all
   Greeks on those days are wrong. 65,160 option rows; the days are removed and behave like
   missing days.
+- **Nine days with expiry dates one day early:** from 2019-04-04 to 2019-04-16 the vendor's expiry
+  date is one day early for most expiries (some fall on a Sunday). The dates are shifted
+  consistently inside the window, so pairing works there, but two thirds of the contracts quoted
+  on 2019-04-03 cannot be matched on 04-04 (1,573 pairs that day against about 5,000), and time to
+  expiry is one day short on those nine days. Not corrected.
 - **Rows with impossible Greeks:** 16,350 option-days that pass every other filter, mostly puts
   with a large negative vega (the raw file has `P_VEGA = -1054.49` where the call at the same
   strike and expiry has 9.68). Although only 0.3% of rows, they mattered: with them in the sample
