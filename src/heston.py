@@ -5,13 +5,14 @@ Under Heston the index and its variance follow
     dS = mu S dt + sqrt(v) S dW_1
     dv = kappa (theta - v) dt + xi sqrt(v) dW_2,     corr(dW_1, dW_2) = rho
 
-Because implied volatility moves with S (rho < 0 gives the equity skew), the
-minimum-variance hedge is not the Black-Scholes delta.  To first order
+Because variance moves with S (rho < 0 gives the equity skew), the hedge ratio that minimises the
+variance of the hedged position is not the Black-Scholes delta.  With C(S, v) the Heston price,
 
-    delta_MV = delta_BS + vega_BS * d(sigma_imp)/dS
+    delta_MV = dC/dS + (rho * xi / S) * dC/dv
 
-so on simulated data we know the *true* correction and can test whether the
-residual network recovers it.  That is the point of this module.
+(the second term is  Cov(dv, dS) / Var(dS) * dC/dv).  On simulated data this is known exactly,
+so we can test whether a model fitted to prices alone recovers it.  That is the point of this
+module: ``mv_delta`` computes it and ``simulate_pairs`` returns a pairs table carrying it.
 
 Option prices use the semi-analytic Heston characteristic-function formula
 (Gauss-Legendre quadrature); implied vols are backed out with ``bs.implied_vol``
@@ -23,6 +24,7 @@ Simulating a full chain every day is slow, so by default we price a modest grid
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 
 import numpy as np
 import pandas as pd
@@ -57,19 +59,32 @@ def _cf(u, S, T, p: HestonParams, v):
     return np.exp(C + D * v + 1j * u * np.log(S))
 
 
-def heston_call(S, K, T, p: HestonParams, v, n_quad: int = 256, u_max: float = 200.0):
-    """European call price by Fourier inversion (Gauss-Legendre on [0, u_max])."""
-    S, K, T, v = (np.atleast_1d(np.asarray(x, dtype=float)) for x in (S, K, T, v))
-    x, w = np.polynomial.legendre.leggauss(n_quad)
-    u = 0.5 * u_max * (x + 1); w = 0.5 * u_max * w
-    u = u[None, :]; w = w[None, :]
+@lru_cache(maxsize=8)
+def _gauss_legendre(n: int):
+    return np.polynomial.legendre.leggauss(n)      # computing the nodes is the slow part; do it once
+
+
+def heston_call(S, K, T, p: HestonParams, v, n_quad: int = 384, u_max: float | None = None):
+    """European call price by Fourier inversion (Gauss-Legendre on [0, u_max]).
+
+    The integrand decays like exp(-u^2 * variance * T / 2), so the cut-off is set row by row from
+    the variance and maturity (``u_max=None``): short-dated options in a calm market need a much
+    longer integration range than long-dated ones.  Pass a number to fix it."""
+    S, K, T, v = np.broadcast_arrays(*(np.atleast_1d(np.asarray(x, dtype=float)) for x in (S, K, T, v)))
+    x, w = _gauss_legendre(n_quad)
+    if u_max is None:
+        v_eff = np.maximum(np.minimum(v, p.theta), 1e-4)
+        top = np.clip(12.0 / np.sqrt(v_eff * T), 50.0, 3000.0)[:, None]
+    else:
+        top = np.full((len(S), 1), float(u_max))
+    u = 0.5 * top * (x[None, :] + 1); w = 0.5 * top * w[None, :]
     S_, K_, T_, v_ = S[:, None], K[:, None], T[:, None], v[:, None]
     cf1 = _cf(u - 1j, S_, T_, p, v_)
     cf2 = _cf(u, S_, T_, p, v_)
     F = S_ * np.exp((p.r - p.q) * T_)
     P1 = 0.5 + (w * np.real(np.exp(-1j * u * np.log(K_)) * cf1 / (1j * u * F))).sum(1) / np.pi
     P2 = 0.5 + (w * np.real(np.exp(-1j * u * np.log(K_)) * cf2 / (1j * u))).sum(1) / np.pi
-    return np.exp(-p.q * T[:, None].ravel()) * S * P1 - K * np.exp(-p.r * T) * P2
+    return np.exp(-p.q * T) * S * P1 - K * np.exp(-p.r * T) * P2
 
 
 def heston_put(S, K, T, p: HestonParams, v):
@@ -139,17 +154,48 @@ def simulate_chain(p: HestonParams = HestonParams(), n_days: int = 1000, seed: i
     return df
 
 
+def mv_delta(S, K, T, kinds, v, p: HestonParams, bump: float = 1e-3) -> np.ndarray:
+    """The Heston minimum-variance delta  dC/dS + (rho xi / S) dC/dv,  by central differences.
+
+    S and v are bumped together along the regression line of dv on dS, whose slope is
+    Cov(dv, dS) / Var(dS) = rho * xi / S, so one pair of repricings gives the whole expression."""
+    S, K, T, v = (np.asarray(x, dtype=float) for x in (S, K, T, v))
+    kinds = np.asarray(kinds)
+    h = S * bump
+    dv = p.rho * p.xi * bump                      # (rho xi / S) * h
+    def price(S_, v_):
+        c = heston_call(S_, K, T, p, np.maximum(v_, 1e-8))
+        return np.where(kinds == "C", c, c - S_ * np.exp(-p.q * T) + K * np.exp(-p.r * T))
+    return (price(S + h, v + dv) - price(S - h, v - dv)) / (2 * h)
+
+
 def true_mv_correction(df: pd.DataFrame, p: HestonParams, bump: float = 1e-3) -> np.ndarray:
-    """Numerical  vega_BS * d(sigma_imp)/dS  from the Heston pricer: the 'right answer'
-    the residual network should approximate.  d(sigma_imp)/dS is obtained by repricing
-    at S(1+bump) with v moved along the leverage correlation."""
-    S, K, T, v = df["S"].to_numpy(), df["strike"].to_numpy(), df["T"].to_numpy(), df["v_true"].to_numpy()
-    kinds = df["type"].to_numpy()
-    dS = S * bump
-    # conditional expected variance change given dS (Heston regression coefficient)
-    dv = p.rho * p.xi * np.sqrt(v) * dS / (S * np.sqrt(v))  # = rho * xi * dS / S
-    S_up, v_up = S + dS, np.maximum(v + dv, 1e-8)
-    price_up = np.where(kinds == "C", heston_call(S_up, K, T, p, v_up), heston_put(S_up, K, T, p, v_up))
-    iv_up = implied_vol(price_up, S_up, K, T, p.r, kinds, p.q)
-    d_iv_dS = (iv_up - df["iv"].to_numpy()) / dS
-    return df["vega"].to_numpy() * d_iv_dS
+    """delta_MV - delta_BS: the correction a residual model should learn."""
+    return mv_delta(df["S"], df["strike"], df["T"], df["type"], df["v_true"], p, bump) - df["delta"].to_numpy()
+
+
+def simulate_pairs(p: HestonParams = HestonParams(), n_days: int = 750, seed: int = 0, split: str = "train",
+                   min_v: float = 0.003, chunk: int = 20_000, **chain_kwargs) -> pd.DataFrame:
+    """A pairs table (same columns as the real one) from one simulated Heston path, plus the truth.
+
+    Extra columns: ``v_true`` (the variance state), ``delta_true`` (the Heston minimum-variance
+    delta) and ``true_corr`` (= delta_true - delta).  The usual sample filters are applied
+    (DTE >= 14, 0.05 <= |delta| <= 0.95).  Days with variance below ``min_v`` are dropped: the
+    Fourier pricer loses accuracy there.  ``split`` labels every row, so several paths can be
+    stacked into train / validation / test sets.
+    """
+    from .build_dataset import pair_frame
+    from .schema import KEY
+    sim = simulate_chain(p, n_days=n_days, seed=seed, **chain_kwargs).drop_duplicates(KEY + ["date"])
+    cal = pd.DatetimeIndex(np.sort(sim["date"].unique()))
+    pairs = pair_frame(sim, cal=cal)
+    pairs["v_true"] = pairs["date"].map(sim.groupby("date")["v_true"].first())
+    keep = (pairs["dte"] >= 14) & pairs["delta"].abs().between(0.05, 0.95) & (pairs["v_true"] >= min_v)
+    pairs = pairs[keep].reset_index(drop=True)
+    pairs["delta_true"] = np.concatenate([
+        mv_delta(c["S"], c["strike"], c["T"], c["type"], c["v_true"], p)
+        for c in (pairs.iloc[i:i + chunk] for i in range(0, len(pairs), chunk))]) if len(pairs) else []
+    pairs["true_corr"] = pairs["delta_true"] - pairs["delta"]
+    pairs["split"] = split
+    pairs["seed"] = seed
+    return pairs
