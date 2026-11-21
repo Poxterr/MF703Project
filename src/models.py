@@ -65,22 +65,25 @@ class HullWhite(HedgeModel):
 
     @staticmethod
     def _design(p: pd.DataFrame) -> np.ndarray:
-        d = p["delta"].to_numpy()
-        scale = p["vega"].to_numpy() / (p["S"].to_numpy() * np.sqrt(p["T"].to_numpy()))
+        # float64 here even when the table is stored as float32: least squares on millions of
+        # rows loses digits in single precision
+        d = p["delta"].to_numpy(dtype="float64")
+        scale = p["vega"].to_numpy(dtype="float64") / (
+            p["S"].to_numpy(dtype="float64") * np.sqrt(p["T"].to_numpy(dtype="float64")))
         return np.column_stack([scale, scale * d, scale * d**2])
 
     def fit(self, pairs):
-        for t, p in pairs.groupby("type"):
+        for t, p in pairs.groupby("type", observed=True):
             X = self._design(p)
-            r = (p["y"] - p["delta"]).to_numpy()
-            sw = np.sqrt(p["w"].to_numpy())
+            r = (p["y"].to_numpy(dtype="float64") - p["delta"].to_numpy(dtype="float64"))
+            sw = np.sqrt(p["w"].to_numpy(dtype="float64"))
             beta, *_ = np.linalg.lstsq(X * sw[:, None], r * sw, rcond=None)
             self.coef_[t] = beta
         return self
 
     def predict(self, pairs):
-        out = pairs["delta"].to_numpy().copy()
-        for t, idx in pairs.groupby("type").indices.items():
+        out = pairs["delta"].to_numpy(dtype="float64").copy()
+        for t, idx in pairs.groupby("type", observed=True).indices.items():
             p = pairs.iloc[idx]
             out[idx] += self._design(p) @ self.coef_[t]
         return out
@@ -89,31 +92,46 @@ class HullWhite(HedgeModel):
 # --------------------------------------------------------------------------- #
 @dataclass
 class GBMResidual(HedgeModel):
-    """LightGBM regression of the residual y - delta_BS on the features, weight dS^2."""
+    """LightGBM regression of the residual y - delta_BS on the features, weight dS^2.
+
+    ``features`` are the numeric inputs; a call/put indicator is always added.
+    Row subsampling needs ``subsample_freq`` > 0 in LightGBM, otherwise ``subsample`` is ignored.
+    """
     name: str = "gbm"
-    features: list[str] = field(default_factory=lambda: FEATURES + ["is_call"])
+    features: list[str] = field(default_factory=lambda: list(FEATURES))
+    seed: int = 0
     params: dict = field(default_factory=lambda: dict(
-        n_estimators=600, learning_rate=0.03, num_leaves=31,
-        min_child_samples=200, subsample=0.8, colsample_bytree=0.8, verbose=-1))
+        n_estimators=600, learning_rate=0.03, num_leaves=31, min_child_samples=500,
+        subsample=0.8, subsample_freq=1, colsample_bytree=0.8, verbose=-1))
 
     def _X(self, p: pd.DataFrame) -> pd.DataFrame:
-        X = p[FEATURES].copy()
-        X["is_call"] = (p["type"] == "C").astype(float)
+        X = p[self.features].copy()
+        X["is_call"] = (p["type"] == "C").astype("float32")
         return X
 
     def fit(self, pairs, val: pd.DataFrame | None = None):
+        import inspect
         import lightgbm as lgb
-        self.model_ = lgb.LGBMRegressor(**self.params)
+        self.model_ = lgb.LGBMRegressor(random_state=self.seed, **self.params)
         kw = {}
-        if val is not None:
-            kw = dict(eval_set=[(self._X(val), (val["y"] - val["delta"]))],
-                      eval_sample_weight=[val["w"]],
-                      callbacks=[lgb.early_stopping(50, verbose=False)])
+        if val is not None and len(val):
+            Xv, yv = self._X(val), val["y"] - val["delta"]
+            # newer LightGBM takes eval_X / eval_y; older versions only eval_set
+            if "eval_X" in inspect.signature(self.model_.fit).parameters:
+                kw = dict(eval_X=Xv, eval_y=yv)
+            else:
+                kw = dict(eval_set=[(Xv, yv)])
+            kw.update(eval_sample_weight=[val["w"]], callbacks=[lgb.early_stopping(50, verbose=False)])
         self.model_.fit(self._X(pairs), pairs["y"] - pairs["delta"], sample_weight=pairs["w"], **kw)
         return self
 
     def predict(self, pairs):
-        return pairs["delta"].to_numpy() + self.model_.predict(self._X(pairs))
+        return pairs["delta"].to_numpy(dtype="float64") + self.model_.predict(self._X(pairs))
+
+    def importance(self) -> pd.Series:
+        """Gain-based feature importance, largest first."""
+        b = self.model_.booster_
+        return pd.Series(b.feature_importance("gain"), index=b.feature_name()).sort_values(ascending=False)
 
 
 # --------------------------------------------------------------------------- #
