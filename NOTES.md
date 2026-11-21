@@ -140,3 +140,22 @@ findings at the end of the notebook. Gain ratio vs Black-Scholes, calls / puts, 
 - Network predictions (seed averages) are saved in `data/processed/predictions/` for notebook 05.
 
 Not done: networks on the traded-only sample, GBM tuning, GPU support in `NeuralHedger`.
+
+## Transaction costs run (2026-11-21)
+
+Notebook 05 executed on the main sample (2019 and 2020, all five models from saved predictions).
+`src/costs.py` rewritten: vectorised, hedging episodes = runs of consecutive trading days (a gap
+starts a new episode), set-up and unwind both charged. Tables in `tables/main/costs/`, figures
+`figures/main/costs_*.png`.
+
+- Rebalancing per day is 0.85-1.06 times Black-Scholes for every model, so costs are nearly
+  identical across models (at 1 bp: ~0.43 pts per episode in 2019, ~0.56 in 2020; differences
+  between models <= 0.03 pts against risk reductions of 0.5-9.4 pts).
+- Net-of-cost gain ratios are flat from 0 to 5 bp; no ranking changes. Costs do not alter any
+  conclusion of notebooks 02-03.
+- Unexpected: scored on episode totals instead of one day, every model beats Black-Scholes in
+  2020, including the paper's networks (nn_direct 0.19 / 0.09, nn_resid 0.11 / 0.14), and LightGBM
+  (0.32 / 0.32) is ahead of Hull-White (0.19 / 0.28). Likely because a steady level error in the
+  hedge ratio cancels over up-and-down days when summed but not when squared daily. NOT tested.
+  Episodes overlap and share one index path, so this is weak evidence; report both horizons.
+- Left out: option bid-ask, financing, market impact, intraday rebalancing.
