@@ -104,3 +104,12 @@ the table above; a proper run with commentary belongs in notebook 02.
 
 Hull-White on puts went from 0.036 to 0.161 on 2020 once the bad vegas were removed.
 Hull-White coefficients: calls (-0.082, -0.139, 0.123), puts (-0.247, -0.264, 0.150).
+
+## Baselines run (2026-11-21)
+
+Notebook 02 executed on both samples; outputs in the notebook (main sample), tables in
+`tables/<sample>/baselines/`, figures in `figures/<sample>/`. Findings are written at the end of
+the notebook. Headline: Hull-White gains 0.042 / 0.101 (calls / puts) on 2019 and 0.191 / 0.161 on
+2020, nearly identical on the traded-only sample; it loses to Black-Scholes in Q3 2020, when the
+index-vol correlation was about zero; LightGBM is better in calm years and worse and unstable in 2020.
+Traded-only sample: 1,941,559 pairs (both legs of a pair must have traded).
