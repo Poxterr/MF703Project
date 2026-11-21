@@ -113,3 +113,30 @@ the notebook. Headline: Hull-White gains 0.042 / 0.101 (calls / puts) on 2019 an
 2020, nearly identical on the traded-only sample; it loses to Black-Scholes in Q3 2020, when the
 index-vol correlation was about zero; LightGBM is better in calm years and worse and unstable in 2020.
 Traded-only sample: 1,941,559 pairs (both legs of a pair must have traded).
+
+## Neural networks run (2026-11-21)
+
+Notebook 03 executed on the main sample: three networks x five seeds, 3x128 sigmoid, Adam 1e-4,
+early stopping on 2019. Tables in `tables/main/neural/`, figures `figures/main/neural_*.png`,
+findings at the end of the notebook. Gain ratio vs Black-Scholes, calls / puts, seed mean (sd):
+
+| | 2019 | 2020 |
+|---|---|---|
+| Hull-White | 0.042 / 0.101 | 0.191 / 0.161 |
+| LightGBM | 0.076 / 0.122 | 0.156 / 0.067 |
+| nn_direct (paper) | 0.087 (0.015) / 0.154 (0.006) | -0.076 (0.079) / -0.840 (0.298) |
+| nn_resid (paper) | 0.095 (0.002) / 0.137 (0.022) | -0.105 (0.065) / -0.138 (0.038) |
+| nn_resid_hw (T, delta; output x vega/(S sqrt T)) | 0.071 (0.003) / 0.146 (0.005) | 0.167 (0.008) / 0.134 (0.009) |
+
+- The paper's result replicates in the calm year: both networks beat Hull-White on 2019.
+- Both of the paper's networks are worse than plain Black-Scholes in 2020, in nearly every seed.
+  Inputs leave the training range (theta 2.2 sd, iv 1.4 sd from the training mean) and the
+  residual network applies a correction of the wrong sign.
+- nn_resid_hw is stable and positive in 2020 but below Hull-White in every seed.
+  **It was designed after seeing the 2020 failures** (`screening_single_seed.csv`), so its 2020
+  number is not a clean out-of-sample test. Say so in the report.
+- Validation gain is nearly identical across seeds while 2020 gain is not: a calm validation
+  year cannot select for crisis robustness.
+- Network predictions (seed averages) are saved in `data/processed/predictions/` for notebook 05.
+
+Not done: networks on the traded-only sample, GBM tuning, GPU support in `NeuralHedger`.
